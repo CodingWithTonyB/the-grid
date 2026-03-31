@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>The Grid</title>
+    <style>
+      body { margin: 0; background: #080808; overflow: hidden; }
+      #splash {
+        position: fixed; inset: 0; z-index: 9999;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        background: #000;
+      }
+
+      /* Phase 1: transitioning — background elements fade, title moves, scan line settles */
+      #splash.transitioning #tron-grid,
+      #splash.transitioning .splash-corner,
+      #splash.transitioning #splash-loader,
+      #splash.transitioning #splash-terminal {
+        transition: opacity 0.5s ease;
+        opacity: 0;
+      }
+      #splash.transitioning #scan-line {
+        animation: none;
+        transition: top 0.8s cubic-bezier(0.4, 0, 0.2, 1),
+                    background 0.5s ease,
+                    box-shadow 0.5s ease,
+                    height 0.5s ease;
+        /* Position to match .divider — below header (2rem padding + ~50px title + 1.5rem bottom) */
+        top: calc(2rem + 56px + 1.5rem);
+        height: 1px;
+        background: linear-gradient(90deg, transparent, rgba(0,255,255,0.15) 15%, rgba(0,255,255,0.15) 85%, transparent);
+        box-shadow: 0 0 8px rgba(0,255,255,0.1);
+      }
+
+      /* Phase 2: fade out splash bg, scan line stays */
+      #splash.fade-out {
+        transition: opacity 0.5s ease 0.1s;
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      /* Title */
+      #splash-title {
+        position: absolute; z-index: 2;
+        font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+        font-size: 28px; font-weight: 700; letter-spacing: 14px;
+        color: #0ff;
+        text-shadow: 0 0 10px rgba(0,255,255,0.8), 0 0 40px rgba(0,255,255,0.4), 0 0 80px rgba(0,255,255,0.2);
+        animation: title-glow 2s ease-in-out infinite alternate;
+        top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        transition: all 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+      }
+      #splash-title.move-up {
+        top: 2rem;
+        left: 50%;
+        transform: translate(-50%, 0);
+        font-size: 42px;
+        letter-spacing: 12px;
+      }
+      @keyframes title-glow {
+        from { text-shadow: 0 0 10px rgba(0,255,255,0.8), 0 0 40px rgba(0,255,255,0.4), 0 0 80px rgba(0,255,255,0.2); }
+        to { text-shadow: 0 0 15px rgba(0,255,255,1), 0 0 50px rgba(0,255,255,0.6), 0 0 100px rgba(0,255,255,0.3); }
+      }
+
+      /* Tron grid */
+      #tron-grid {
+        position: absolute; inset: 0;
+        background:
+          linear-gradient(transparent 0%, rgba(0,0,0,0.6) 40%, rgba(0,0,0,0.2) 100%),
+          linear-gradient(rgba(0,255,255,0.07) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0,255,255,0.07) 1px, transparent 1px);
+        background-size: 100% 100%, 40px 40px, 40px 40px;
+        overflow: hidden;
+      }
+      #tron-grid::after {
+        content: '';
+        position: absolute;
+        left: 0; right: 0; bottom: 0; height: 55%;
+        background:
+          linear-gradient(rgba(0,255,255,0.12) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0,255,255,0.12) 1px, transparent 1px);
+        background-size: 60px 60px;
+        transform: rotateX(60deg);
+        transform-origin: bottom center;
+        mask-image: linear-gradient(transparent, black 20%);
+        -webkit-mask-image: linear-gradient(transparent, black 20%);
+      }
+
+      /* Scan line */
+      #scan-line {
+        position: absolute; left: 0; right: 0;
+        height: 2px;
+        background: linear-gradient(90deg, transparent, rgba(0,255,255,0.6), transparent);
+        box-shadow: 0 0 20px 4px rgba(0,255,255,0.3);
+        animation: scan 2.5s ease-in-out infinite;
+      }
+      @keyframes scan {
+        0%, 100% { top: 20%; opacity: 0; }
+        10% { opacity: 1; }
+        90% { opacity: 1; }
+        50% { top: 80%; }
+      }
+
+      /* Loading bar */
+      #splash-loader {
+        position: absolute; z-index: 2;
+        top: calc(50% + 40px); left: 50%;
+        transform: translateX(-50%);
+        width: 160px; height: 2px;
+        background: rgba(0,255,255,0.1);
+        border-radius: 1px;
+        overflow: hidden;
+      }
+      #splash-loader::after {
+        content: '';
+        position: absolute; left: -40%; top: 0; bottom: 0;
+        width: 40%;
+        background: linear-gradient(90deg, transparent, #0ff, transparent);
+        box-shadow: 0 0 12px rgba(0,255,255,0.6);
+        animation: loader-slide 1.2s ease-in-out infinite;
+      }
+      @keyframes loader-slide {
+        0% { left: -40%; }
+        100% { left: 100%; }
+      }
+
+      /* Corner accents — match App.css positions (20px) */
+      .splash-corner {
+        position: absolute; width: 30px; height: 30px; z-index: 2;
+        border-color: rgba(0,255,255,0.3); border-style: solid; border-width: 0;
+      }
+      .splash-corner--tl { top: 20px; left: 20px; border-top-width: 1px; border-left-width: 1px; }
+      .splash-corner--tr { top: 20px; right: 20px; border-top-width: 1px; border-right-width: 1px; }
+      .splash-corner--bl { bottom: 20px; left: 20px; border-bottom-width: 1px; border-left-width: 1px; }
+      .splash-corner--br { bottom: 20px; right: 20px; border-bottom-width: 1px; border-right-width: 1px; }
+
+      /* Terminal log */
+      #splash-terminal {
+        position: absolute;
+        bottom: 28px; left: 28px;
+        z-index: 3;
+        font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+        font-size: 10px;
+        line-height: 1.6;
+        color: rgba(0,255,255,0.5);
+        max-width: 420px;
+        max-height: 120px;
+        overflow: hidden;
+      }
+      .term-line {
+        white-space: nowrap;
+        animation: term-fade-in 0.2s ease;
+      }
+      .term-line::before {
+        content: '> ';
+        color: rgba(0,255,255,0.3);
+      }
+      .term-line--ready {
+        color: #0f6;
+        text-shadow: 0 0 6px rgba(0,255,0,0.4);
+      }
+      .term-line--ready::before {
+        content: '✓ ';
+        color: #0f6;
+      }
+      @keyframes term-fade-in {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="splash">
+      <div id="tron-grid"></div>
+      <div id="scan-line"></div>
+      <div class="splash-corner splash-corner--tl"></div>
+      <div class="splash-corner splash-corner--tr"></div>
+      <div class="splash-corner splash-corner--bl"></div>
+      <div class="splash-corner splash-corner--br"></div>
+      <div id="splash-title">THE GRID</div>
+      <div id="splash-loader"></div>
+      <div id="splash-terminal"></div>
+    </div>
+    <div id="root"></div>
+    <script>
+      window.__splashLogQueue = []
+      window.__splashTyping = false
+
+      function __typeOutLine(el, msg) {
+        return new Promise(function(resolve) {
+          var isReady = msg.startsWith('READY')
+          var line = document.createElement('div')
+          line.className = isReady ? 'term-line term-line--ready' : 'term-line'
+          line.textContent = ''
+          el.appendChild(line)
+          while (el.children.length > 14) el.removeChild(el.firstChild)
+
+          var i = 0
+          function tick() {
+            if (i < msg.length) {
+              var chunk = Math.min(msg.length - i, 3 + Math.floor(Math.random() * 5))
+              line.textContent += msg.slice(i, i + chunk)
+              i += chunk
+              el.scrollTop = el.scrollHeight
+              setTimeout(tick, 1 + Math.random() * 3)
+            } else {
+              resolve()
+            }
+          }
+          tick()
+        })
+      }
+
+      function __processQueue() {
+        if (window.__splashTyping) return
+        var el = document.getElementById('splash-terminal')
+        if (!el || window.__splashLogQueue.length === 0) return
+
+        window.__splashTyping = true
+        var msg = window.__splashLogQueue.shift()
+
+        __typeOutLine(el, msg).then(function() {
+          window.__splashTyping = false
+          if (window.__splashLogQueue.length > 0) {
+            setTimeout(__processQueue, 10 + Math.random() * 30)
+          }
+        })
+      }
+
+      window.__splashLog = function(msg) {
+        window.__splashLogQueue.push(msg)
+        __processQueue()
+      }
+
+      window.__splashReady = function() {
+        var splash = document.getElementById('splash')
+        var title = document.getElementById('splash-title')
+        if (!splash || !title) return
+
+        // Wait for typing queue to drain before transitioning
+        function waitForQueue(cb) {
+          if (window.__splashLogQueue.length > 0 || window.__splashTyping) {
+            setTimeout(function() { waitForQueue(cb) }, 50)
+          } else {
+            cb()
+          }
+        }
+
+        waitForQueue(function() {
+        var elapsed = Date.now() - window.__splashStart
+        var delay = Math.max(0, 1500 - elapsed)
+
+        setTimeout(function() {
+          // Step 1: title moves up, scan line settles to divider, bg elements fade
+          title.classList.add('move-up')
+          splash.classList.add('transitioning')
+
+          // Step 2: fade out entire splash overlay
+          setTimeout(function() {
+            splash.classList.add('fade-out')
+            setTimeout(function() { splash.remove() }, 600)
+          }, 800)
+        }, delay)
+        })
+      }
+
+      window.__splashStart = Date.now()
+      window.__splashLog('boot :: initializing the grid')
+      window.__splashLog('boot :: loading electron preload')
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

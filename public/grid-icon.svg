@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="45%" r="65%">
+      <stop offset="0%" stop-color="#0e1e2e"/>
+      <stop offset="100%" stop-color="#040810"/>
+    </radialGradient>
+    <radialGradient id="center-glow" cx="50%" cy="50%" r="40%">
+      <stop offset="0%" stop-color="rgba(0,255,255,0.15)"/>
+      <stop offset="100%" stop-color="rgba(0,255,255,0)"/>
+    </radialGradient>
+    <filter id="heavy-glow">
+      <feGaussianBlur stdDeviation="18" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="med-glow">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="soft-glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <clipPath id="squircle-clip">
+      <rect x="80" y="80" width="864" height="864" rx="190"/>
+    </clipPath>
+  </defs>
+
+  <!-- Squircle background with padding -->
+  <rect x="80" y="80" width="864" height="864" rx="190" fill="url(#bg)"/>
+  <rect x="80" y="80" width="864" height="864" rx="190" fill="url(#center-glow)"/>
+
+  <!-- Everything clipped to squircle -->
+  <g clip-path="url(#squircle-clip)">
+
+    <!-- Perspective grid floor (Tron-style vanishing point) -->
+    <g stroke="rgba(0,255,255,0.04)" stroke-width="1">
+      <!-- Horizontal perspective lines -->
+      <line x1="80" y1="600" x2="944" y2="600"/>
+      <line x1="80" y1="680" x2="944" y2="680"/>
+      <line x1="80" y1="740" x2="944" y2="740"/>
+      <line x1="80" y1="790" x2="944" y2="790"/>
+      <line x1="80" y1="830" x2="944" y2="830"/>
+      <line x1="80" y1="860" x2="944" y2="860"/>
+      <line x1="80" y1="885" x2="944" y2="885"/>
+      <line x1="80" y1="905" x2="944" y2="905"/>
+      <!-- Vertical converging lines -->
+      <line x1="512" y1="440" x2="80" y2="944"/>
+      <line x1="512" y1="440" x2="200" y2="944"/>
+      <line x1="512" y1="440" x2="350" y2="944"/>
+      <line x1="512" y1="440" x2="512" y2="944"/>
+      <line x1="512" y1="440" x2="674" y2="944"/>
+      <line x1="512" y1="440" x2="824" y2="944"/>
+      <line x1="512" y1="440" x2="944" y2="944"/>
+    </g>
+
+    <!-- Horizon glow line -->
+    <line x1="120" y1="520" x2="904" y2="520" stroke="rgba(0,255,255,0.12)" stroke-width="1" filter="url(#med-glow)"/>
+
+    <!-- Subtle top grid (circuit board feel) -->
+    <g stroke="rgba(0,255,255,0.03)" stroke-width="0.5">
+      <line x1="300" y1="120" x2="300" y2="480"/>
+      <line x1="420" y1="120" x2="420" y2="480"/>
+      <line x1="512" y1="120" x2="512" y2="480"/>
+      <line x1="604" y1="120" x2="604" y2="480"/>
+      <line x1="724" y1="120" x2="724" y2="480"/>
+      <line x1="160" y1="220" x2="864" y2="220"/>
+      <line x1="160" y1="340" x2="864" y2="340"/>
+    </g>
+
+    <!-- 2x2 Grid squares — main icon element -->
+    <!-- Outer glow layer -->
+    <g filter="url(#heavy-glow)" opacity="0.6">
+      <rect x="302" y="248" width="175" height="175" rx="16" fill="none" stroke="rgba(0,255,255,0.5)" stroke-width="2"/>
+      <rect x="547" y="248" width="175" height="175" rx="16" fill="none" stroke="rgba(0,255,255,0.4)" stroke-width="2"/>
+      <rect x="302" y="420" width="175" height="175" rx="16" fill="none" stroke="rgba(0,255,255,0.35)" stroke-width="2"/>
+      <rect x="547" y="420" width="175" height="175" rx="16" fill="none" stroke="rgba(0,255,255,0.5)" stroke-width="2"/>
+    </g>
+
+    <!-- Sharp square borders -->
+    <g filter="url(#soft-glow)">
+      <!-- Top-left — brightest -->
+      <rect x="302" y="248" width="175" height="175" rx="16"
+        fill="rgba(0,255,255,0.06)" stroke="rgba(0,255,255,0.7)" stroke-width="1.5"/>
+      <!-- Circuit traces inside TL -->
+      <line x1="322" y1="300" x2="380" y2="300" stroke="rgba(0,255,255,0.2)" stroke-width="1"/>
+      <line x1="380" y1="300" x2="380" y2="360" stroke="rgba(0,255,255,0.2)" stroke-width="1"/>
+      <circle cx="380" cy="360" r="3" fill="rgba(0,255,255,0.35)"/>
+      <line x1="420" y1="280" x2="420" y2="340" stroke="rgba(0,255,255,0.15)" stroke-width="1"/>
+      <circle cx="420" cy="340" r="2" fill="rgba(0,255,255,0.25)"/>
+
+      <!-- Top-right -->
+      <rect x="547" y="248" width="175" height="175" rx="16"
+        fill="rgba(0,255,255,0.04)" stroke="rgba(0,255,255,0.5)" stroke-width="1.5"/>
+      <!-- Circuit traces inside TR -->
+      <line x1="580" y1="330" x2="650" y2="330" stroke="rgba(0,255,255,0.15)" stroke-width="1"/>
+      <circle cx="650" cy="330" r="3" fill="rgba(0,255,255,0.3)"/>
+      <line x1="600" y1="290" x2="600" y2="370" stroke="rgba(0,255,255,0.12)" stroke-width="1"/>
+
+      <!-- Bottom-left -->
+      <rect x="302" y="420" width="175" height="175" rx="16"
+        fill="rgba(0,255,255,0.03)" stroke="rgba(0,255,255,0.45)" stroke-width="1.5"/>
+      <!-- Circuit traces inside BL -->
+      <line x1="340" y1="480" x2="400" y2="480" stroke="rgba(0,255,255,0.12)" stroke-width="1"/>
+      <line x1="400" y1="480" x2="400" y2="540" stroke="rgba(0,255,255,0.12)" stroke-width="1"/>
+      <circle cx="340" cy="480" r="2" fill="rgba(0,255,255,0.2)"/>
+
+      <!-- Bottom-right — second brightest -->
+      <rect x="547" y="420" width="175" height="175" rx="16"
+        fill="rgba(0,255,255,0.07)" stroke="rgba(0,255,255,0.65)" stroke-width="1.5"/>
+      <!-- Circuit traces inside BR -->
+      <line x1="580" y1="460" x2="580" y2="520" stroke="rgba(0,255,255,0.18)" stroke-width="1"/>
+      <line x1="580" y1="520" x2="660" y2="520" stroke="rgba(0,255,255,0.18)" stroke-width="1"/>
+      <circle cx="660" cy="520" r="3" fill="rgba(0,255,255,0.35)"/>
+      <circle cx="580" cy="460" r="2" fill="rgba(0,255,255,0.25)"/>
+    </g>
+
+    <!-- Connecting data lines between squares -->
+    <g filter="url(#soft-glow)">
+      <!-- Horizontal bridge -->
+      <line x1="477" y1="335" x2="547" y2="335" stroke="rgba(0,255,255,0.3)" stroke-width="1" stroke-dasharray="4,3"/>
+      <line x1="477" y1="507" x2="547" y2="507" stroke="rgba(0,255,255,0.25)" stroke-width="1" stroke-dasharray="4,3"/>
+      <!-- Vertical bridge -->
+      <line x1="390" y1="423" x2="390" y2="420" stroke="rgba(0,255,255,0.25)" stroke-width="1"/>
+      <line x1="635" y1="423" x2="635" y2="420" stroke="rgba(0,255,255,0.3)" stroke-width="1"/>
+    </g>
+
+    <!-- Corner accents on the squircle -->
+    <g stroke="rgba(0,255,255,0.3)" stroke-width="1.5" fill="none" filter="url(#soft-glow)">
+      <path d="M140,200 L140,150 L190,150"/>
+      <path d="M834,150 L884,150 L884,200"/>
+      <path d="M140,824 L140,874 L190,874"/>
+      <path d="M834,874 L884,874 L884,824"/>
+    </g>
+
+    <!-- Small data dots scattered -->
+    <g fill="rgba(0,255,255,0.15)">
+      <circle cx="250" cy="300" r="1.5"/>
+      <circle cx="780" cy="280" r="1.5"/>
+      <circle cx="220" cy="500" r="1.5"/>
+      <circle cx="800" cy="470" r="1.5"/>
+      <circle cx="512" cy="200" r="2"/>
+    </g>
+
+  </g>
+
+  <!-- Squircle border (subtle edge) -->
+  <rect x="80" y="80" width="864" height="864" rx="190" fill="none" stroke="rgba(0,255,255,0.08)" stroke-width="1"/>
+</svg>

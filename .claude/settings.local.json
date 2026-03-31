@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(networksetup -getairportnetwork en1 2)",
+      "Bash(/dev/null networksetup:*)",
+      "Bash(/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I)",
+      "Bash(ipconfig getsummary:*)",
+      "WebSearch",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:ipcamtalk.com)",
+      "Bash(npm list:*)",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(curl -s --max-time 8 http://192.168.12.125/admin)",
+      "Bash(curl -s --max-time 8 http://192.168.12.125/config)",
+      "Bash(curl -s --max-time 8 http://192.168.12.125/version)",
+      "Bash(curl -s --max-time 8 http://192.168.12.125/nVersion)",
+      "Bash(grep -oE 'submitColor[^;]{0,300}')",
+      "Bash(grep -oE '\\(xhr|xhttp|http\\)\\\\.[a-z]+\\\\\\([^\\)]{0,200}\\\\\\)')",
+      "Bash(curl -s --max-time 8 http://192.168.12.106/config)",
+      "Bash(ping -c 2 192.168.12.106)",
+      "Bash(curl -s http://192.168.12.125/admin)",
+      "Bash(node -e \":*)",
+      "Bash(curl -s \"http://192.168.12.125/SetP?p=50\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''light:'''', d[''''light'''']\\)\")",
+      "mcp__Desktop_Commander__read_file"
+    ]
+  }
+}

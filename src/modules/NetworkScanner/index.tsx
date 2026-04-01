@@ -28,6 +28,35 @@ interface History {
   [mac: string]: HistoryEntry
 }
 
+interface PortInfo {
+  port: number
+  name: string
+  banner: string
+}
+
+interface HttpInfo {
+  port: number
+  server: string
+  title: string
+  redirectUrl: string
+  secure: boolean
+}
+
+interface ProbeResult {
+  ip: string
+  mac: string
+  vendor: string
+  ttl: number | null
+  osGuess: string
+  ports: PortInfo[]
+  http: HttpInfo[]
+  mdnsServices: string[]
+  netbiosName?: string
+  ssdpInfo?: string
+  arpType?: string
+  reverseDns?: string
+}
+
 type Tab = 'online' | 'history'
 
 function timeAgo(iso: string): string {
@@ -52,8 +81,13 @@ export default function NetworkScanner() {
   const [draft, setDraft] = useState<DeviceNote>({ label: '', note: '' })
   const [tab, setTab] = useState<Tab>('online')
 
+  // Probe state
+  const [probing, setProbing] = useState<string | null>(null) // IP being probed
+  const [probeResults, setProbeResults] = useState<Record<string, ProbeResult>>({})
+  const [deepScanAll, setDeepScanAll] = useState(false)
+  const [deepScanProgress, setDeepScanProgress] = useState<{ current: number; total: number; ip: string } | null>(null)
+
   useEffect(() => {
-    // Load cached results immediately, then subscribe to background updates
     Promise.all([
       window.ipcRenderer.invoke('load-notes').then(setNotes),
       window.ipcRenderer.invoke('load-history').then(setHistory),
@@ -65,21 +99,25 @@ export default function NetworkScanner() {
       }),
       window.ipcRenderer.invoke('get-ssid').then(setSsid),
     ]).then(() => {
-      // Only do a fresh scan if no cached data was available
       if (devices.length === 0) runScan()
     })
 
-    // Listen for background scan updates
     const onUpdate = (_e: unknown, result: Device[]) => {
       setDevices(result)
       setLastScanned(new Date())
     }
     window.ipcRenderer.on('scanner-update', onUpdate)
 
+    const onDeepProgress = (_e: unknown, progress: { current: number; total: number; ip: string }) => {
+      setDeepScanProgress(progress)
+    }
+    window.ipcRenderer.on('deep-scan-progress', onDeepProgress)
+
     const tickInterval = setInterval(() => setTick(t => t + 1), 10_000)
 
     return () => {
       window.ipcRenderer.off('scanner-update', onUpdate)
+      window.ipcRenderer.off('deep-scan-progress', onDeepProgress)
       clearInterval(tickInterval)
     }
   }, [])
@@ -91,7 +129,6 @@ export default function NetworkScanner() {
       window.ipcRenderer.invoke('get-ssid'),
     ])
     const now = new Date().toISOString()
-
     setSsid(currentSsid)
 
     const currentHistory: History = await window.ipcRenderer.invoke('load-history')
@@ -120,6 +157,30 @@ export default function NetworkScanner() {
     setSelected(null)
   }
 
+  async function probeDevice(ip: string, mac: string) {
+    setProbing(ip)
+    const result: ProbeResult = await window.ipcRenderer.invoke('probe-device', ip, mac)
+    setProbeResults(prev => ({ ...prev, [ip]: result }))
+    setProbing(null)
+  }
+
+  async function deepProbeDevice(ip: string, mac: string) {
+    setProbing(ip)
+    const result: ProbeResult = await window.ipcRenderer.invoke('deep-probe-device', ip, mac)
+    setProbeResults(prev => ({ ...prev, [ip]: result }))
+    setProbing(null)
+  }
+
+  async function runDeepScanAll() {
+    setDeepScanAll(true)
+    setDeepScanProgress({ current: 0, total: devices.length, ip: '' })
+    const deviceList = devices.map(d => ({ ip: d.ip, mac: d.mac }))
+    const results: Record<string, ProbeResult> = await window.ipcRenderer.invoke('deep-scan-all', deviceList)
+    setProbeResults(prev => ({ ...prev, ...results }))
+    setDeepScanAll(false)
+    setDeepScanProgress(null)
+  }
+
   const sortedDevices = [...devices].sort((a, b) => {
     const aHasLabel = !!(notes[a.mac]?.label)
     const bHasLabel = !!(notes[b.mac]?.label)
@@ -133,10 +194,101 @@ export default function NetworkScanner() {
     .filter(h => !onlineMacs.has(h.mac) && h.ssid === ssid)
     .sort((a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime())
 
+  function renderProbeResult(ip: string) {
+    const probe = probeResults[ip]
+    if (!probe) return null
+
+    return (
+      <div className="probe-results">
+        {/* Device identity */}
+        <div className="probe-section">
+          <div className="probe-identity">
+            {probe.vendor && <span className="probe-vendor">{probe.vendor}</span>}
+            <span className="probe-os">{probe.osGuess}</span>
+            {probe.ttl != null && <span className="probe-ttl">TTL {probe.ttl}</span>}
+            {probe.arpType && <span className="probe-ttl">ARP: {probe.arpType}</span>}
+          </div>
+          {probe.reverseDns && (
+            <div className="probe-extra-row">
+              <span className="meta-key">DNS</span>
+              <span className="probe-extra-val">{probe.reverseDns}</span>
+            </div>
+          )}
+          {probe.ssdpInfo && (
+            <div className="probe-extra-row">
+              <span className="meta-key">SSDP</span>
+              <span className="probe-extra-val">{probe.ssdpInfo}</span>
+            </div>
+          )}
+          {probe.netbiosName && (
+            <div className="probe-extra-row">
+              <span className="meta-key">NETBIOS</span>
+              <span className="probe-extra-val">{probe.netbiosName}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Open ports */}
+        {probe.ports.length > 0 && (
+          <div className="probe-section">
+            <div className="probe-section-title">OPEN PORTS ({probe.ports.length})</div>
+            <div className="probe-ports">
+              {probe.ports.map(p => (
+                <div key={p.port} className="probe-port-row">
+                  <span className="probe-port-num">{p.port}</span>
+                  <span className="probe-port-name">{p.name}</span>
+                  {p.banner && (
+                    <span className="probe-port-banner" title={p.banner}>
+                      {p.banner.slice(0, 60)}{p.banner.length > 60 ? '...' : ''}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Web services */}
+        {probe.http.length > 0 && (
+          <div className="probe-section">
+            <div className="probe-section-title">WEB SERVICES</div>
+            {probe.http.map(h => (
+              <div key={h.port} className="probe-http-row">
+                <span className="probe-http-badge">{h.secure ? 'HTTPS' : 'HTTP'}:{h.port}</span>
+                {h.title && <span className="probe-http-title">{h.title}</span>}
+                {h.server && <span className="probe-http-server">{h.server}</span>}
+                {h.redirectUrl && <span className="probe-http-redirect">→ {h.redirectUrl}</span>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* mDNS services */}
+        {probe.mdnsServices.length > 0 && (
+          <div className="probe-section">
+            <div className="probe-section-title">mDNS SERVICES</div>
+            <div className="probe-mdns">
+              {probe.mdnsServices.map(s => (
+                <span key={s} className="probe-mdns-tag">{s}</span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Nothing found */}
+        {probe.ports.length === 0 && (
+          <div className="probe-empty">No open ports found — device may have a firewall</div>
+        )}
+      </div>
+    )
+  }
+
   function renderDeviceRow(mac: string, ip: string, hostname: string | null, iface: string, isOffline = false) {
     const info = notes[mac]
     const isOpen = selected === mac
     const primary = info?.label || null
+    const hasProbe = !!probeResults[ip]
+    const isProbing = probing === ip
 
     return (
       <div key={mac} className={`device-row${isOpen ? ' device-row--open' : ''}${isOffline ? ' device-row--offline' : ''}`}>
@@ -148,6 +300,12 @@ export default function NetworkScanner() {
               {!primary && hostname && <span className="device-hostname">{hostname}</span>}
               {isOffline && (
                 <span className="device-offline-time">last seen {timeAgo(history[mac]?.lastSeen ?? '')}</span>
+              )}
+              {hasProbe && !isOpen && (
+                <span className="device-probe-badge">
+                  {probeResults[ip].ports.length} ports · {probeResults[ip].osGuess}
+                  {probeResults[ip].vendor ? ` · ${probeResults[ip].vendor}` : ''}
+                </span>
               )}
             </div>
           </div>
@@ -170,6 +328,36 @@ export default function NetworkScanner() {
               <span className="meta-val">{hostname ?? '—'}</span>
               {!isOffline && <><span className="meta-key">IF</span><span className="meta-val">{iface}</span></>}
             </div>
+
+            {/* Probe buttons */}
+            {!isOffline && (
+              <div className="probe-btn-row">
+                <button
+                  className={`scan-btn probe-btn${isProbing ? ' probe-btn--scanning' : ''}`}
+                  onClick={() => probeDevice(ip, mac)}
+                  disabled={isProbing}
+                >
+                  {isProbing ? 'PROBING...' : hasProbe ? 'PROBE AGAIN' : 'PROBE'}
+                </button>
+                <button
+                  className={`scan-btn probe-btn probe-btn--deep${isProbing ? ' probe-btn--scanning' : ''}`}
+                  onClick={() => deepProbeDevice(ip, mac)}
+                  disabled={isProbing}
+                >
+                  {isProbing ? 'SCANNING...' : 'DEEP PROBE'}
+                </button>
+              </div>
+            )}
+
+            {/* Probe results */}
+            {isProbing && (
+              <div className="probe-loading">
+                <span className="scan-pulse">SCANNING PORTS & SERVICES</span>
+              </div>
+            )}
+            {hasProbe && !isProbing && renderProbeResult(ip)}
+
+            {/* Notes */}
             <input
               className="note-input"
               placeholder="Label  (e.g. Tony's iPhone)"
@@ -202,6 +390,19 @@ export default function NetworkScanner() {
         </div>
 
         {ssid && <div className="ssid-badge">{ssid}</div>}
+
+        <div className="scanner-actions">
+          {!deepScanAll && devices.length > 0 && (
+            <button className="scan-btn probe-btn" onClick={runDeepScanAll} disabled={deepScanAll}>
+              SCAN ALL
+            </button>
+          )}
+          {deepScanAll && deepScanProgress && (
+            <span className="scan-pulse deep-scan-status">
+              {deepScanProgress.current}/{deepScanProgress.total} — {deepScanProgress.ip}
+            </span>
+          )}
+        </div>
 
         <div className="scanner-status">
           {scanning

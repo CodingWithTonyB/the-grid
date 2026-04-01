@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, safeStorage, Notification } from 'electron'
+import { app, BrowserWindow, ipcMain, safeStorage, Notification, session } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { exec, spawn, ChildProcess } from 'node:child_process'
@@ -6,6 +6,8 @@ import { promisify } from 'node:util'
 import fs from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
+import net from 'node:net'
+// dgram available if needed for UDP probes
 import { Client, type ConnectConfig } from 'ssh2'
 
 const execAsync = promisify(exec)
@@ -204,6 +206,18 @@ ipcMain.handle('load-layout', () => {
 
 ipcMain.handle('save-layout', (_event, layout: unknown) => {
   fs.writeFileSync(path.join(app.getPath('userData'), 'grid-layout.json'), JSON.stringify(layout, null, 2))
+})
+
+ipcMain.handle('load-archived', () => {
+  try {
+    const p = path.join(app.getPath('userData'), 'archived-modules.json')
+    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf-8'))
+  } catch {}
+  return []
+})
+
+ipcMain.handle('save-archived', (_event, archived: string[]) => {
+  fs.writeFileSync(path.join(app.getPath('userData'), 'archived-modules.json'), JSON.stringify(archived, null, 2))
 })
 
 // ── Password encryption (OS keychain via safeStorage) ────────────────
@@ -417,6 +431,721 @@ ipcMain.handle('load-history', () => {
 
 ipcMain.handle('save-history', (_event, history: unknown) => {
   fs.writeFileSync(historyPath(), JSON.stringify(history, null, 2))
+})
+
+// --- Network Probe / Deep Scan ---
+
+// Common ports to scan, grouped by service type
+const PROBE_PORTS: { port: number; name: string; proto: string }[] = [
+  { port: 21, name: 'FTP', proto: 'tcp' },
+  { port: 22, name: 'SSH', proto: 'tcp' },
+  { port: 23, name: 'Telnet', proto: 'tcp' },
+  { port: 25, name: 'SMTP', proto: 'tcp' },
+  { port: 53, name: 'DNS', proto: 'tcp' },
+  { port: 80, name: 'HTTP', proto: 'tcp' },
+  { port: 443, name: 'HTTPS', proto: 'tcp' },
+  { port: 445, name: 'SMB', proto: 'tcp' },
+  { port: 548, name: 'AFP', proto: 'tcp' },
+  { port: 554, name: 'RTSP', proto: 'tcp' },
+  { port: 631, name: 'IPP/CUPS', proto: 'tcp' },
+  { port: 1883, name: 'MQTT', proto: 'tcp' },
+  { port: 3000, name: 'Dev Server', proto: 'tcp' },
+  { port: 3306, name: 'MySQL', proto: 'tcp' },
+  { port: 3389, name: 'RDP', proto: 'tcp' },
+  { port: 5000, name: 'UPnP/Dev', proto: 'tcp' },
+  { port: 5353, name: 'mDNS', proto: 'tcp' },
+  { port: 5432, name: 'PostgreSQL', proto: 'tcp' },
+  { port: 5900, name: 'VNC', proto: 'tcp' },
+  { port: 8000, name: 'HTTP Alt', proto: 'tcp' },
+  { port: 8080, name: 'HTTP Proxy', proto: 'tcp' },
+  { port: 8443, name: 'HTTPS Alt', proto: 'tcp' },
+  { port: 8883, name: 'MQTT TLS', proto: 'tcp' },
+  { port: 9090, name: 'Prometheus', proto: 'tcp' },
+  { port: 9100, name: 'Printer', proto: 'tcp' },
+  { port: 32400, name: 'Plex', proto: 'tcp' },
+  { port: 49152, name: 'UPnP', proto: 'tcp' },
+  { port: 62078, name: 'iPhone', proto: 'tcp' },
+]
+
+// TCP connect scan a single port with timeout
+function tcpProbe(ip: string, port: number, timeout = 1500): Promise<{ open: boolean; banner: string }> {
+  return new Promise(resolve => {
+    const socket = new net.Socket()
+    let banner = ''
+    const timer = setTimeout(() => {
+      socket.destroy()
+      resolve({ open: false, banner: '' })
+    }, timeout)
+
+    socket.connect(port, ip, () => {
+      // Port is open — try to read a banner
+      socket.setTimeout(800)
+    })
+
+    socket.on('data', (data) => {
+      banner += data.toString('utf-8', 0, Math.min(data.length, 512))
+      clearTimeout(timer)
+      socket.destroy()
+      resolve({ open: true, banner: banner.trim() })
+    })
+
+    socket.on('timeout', () => {
+      clearTimeout(timer)
+      socket.destroy()
+      resolve({ open: true, banner: '' })
+    })
+
+    socket.on('error', () => {
+      clearTimeout(timer)
+      socket.destroy()
+      resolve({ open: false, banner: '' })
+    })
+  })
+}
+
+// Grab HTTP headers and title from a web server
+async function httpProbe(ip: string, port: number, secure: boolean): Promise<{
+  server: string; title: string; headers: Record<string, string>; redirectUrl: string
+}> {
+  return new Promise(resolve => {
+    const result = { server: '', title: '', headers: {} as Record<string, string>, redirectUrl: '' }
+    const mod = secure ? https : http
+    const req = mod.get({
+      hostname: ip, port, path: '/', timeout: 3000,
+      rejectUnauthorized: false,
+      headers: { 'User-Agent': 'TheGrid/1.0' },
+    }, (res) => {
+      result.headers = res.headers as Record<string, string>
+      result.server = (res.headers['server'] || '') as string
+      if (res.headers['location']) result.redirectUrl = res.headers['location'] as string
+
+      let body = ''
+      res.setEncoding('utf-8')
+      res.on('data', chunk => { body += chunk; if (body.length > 4096) res.destroy() })
+      res.on('end', () => {
+        const titleMatch = body.match(/<title[^>]*>([^<]+)<\/title>/i)
+        if (titleMatch) result.title = titleMatch[1].trim()
+        resolve(result)
+      })
+      res.on('error', () => resolve(result))
+    })
+    req.on('error', () => resolve(result))
+    req.on('timeout', () => { req.destroy(); resolve(result) })
+  })
+}
+
+// Get ping TTL to guess OS type
+async function getTTL(ip: string): Promise<number | null> {
+  try {
+    const { stdout } = await execAsync(`ping -c 1 -W 1000 ${ip}`)
+    const match = stdout.match(/ttl[=:](\d+)/i)
+    return match ? parseInt(match[1]) : null
+  } catch { return null }
+}
+
+function guessOS(ttl: number | null): string {
+  if (!ttl) return 'Unknown'
+  if (ttl <= 64 && ttl > 32) return 'Linux/macOS/iOS'
+  if (ttl <= 128 && ttl > 64) return 'Windows'
+  if (ttl <= 255 && ttl > 128) return 'Network device'
+  if (ttl <= 32) return 'Embedded/IoT'
+  return 'Unknown'
+}
+
+// MAC vendor lookup (first 3 octets → OUI)
+// Small built-in table of common vendors
+const MAC_VENDORS: Record<string, string> = {
+  '00:50:56': 'VMware', '00:0c:29': 'VMware', '00:1c:42': 'Parallels',
+  'b8:27:eb': 'Raspberry Pi', 'dc:a6:32': 'Raspberry Pi', 'e4:5f:01': 'Raspberry Pi',
+  'd8:3a:dd': 'Raspberry Pi',
+  '00:17:88': 'Philips Hue', 'ec:b5:fa': 'Philips Hue',
+  'f0:d5:bf': 'Google', '30:fd:38': 'Google', 'a4:77:33': 'Google',
+  '44:07:0b': 'Google', '54:60:09': 'Google',
+  '68:ff:7b': 'Amazon', '74:c2:46': 'Amazon', 'a4:08:01': 'Amazon',
+  'fc:65:de': 'Amazon', '14:91:82': 'Amazon',
+  '3c:22:fb': 'Apple', 'a8:60:b6': 'Apple', 'f0:18:98': 'Apple',
+  'ac:de:48': 'Apple', '00:a0:40': 'Apple', '88:66:a5': 'Apple',
+  'bc:d0:74': 'Apple', 'f8:ff:c2': 'Apple', '78:7b:8a': 'Apple',
+  '28:6c:07': 'Apple', 'a4:83:e7': 'Apple', '6c:96:cf': 'Apple',
+  'a0:99:9b': 'Apple',
+  '50:02:91': 'Samsung', 'a8:7c:01': 'Samsung', 'c0:97:27': 'Samsung',
+  'f4:42:8f': 'Samsung', '30:07:4d': 'Samsung',
+  'b0:be:76': 'TP-Link', '60:32:b1': 'TP-Link', 'c0:06:c3': 'TP-Link',
+  '98:da:c4': 'TP-Link', 'ac:15:a2': 'TP-Link',
+  '44:d9:e7': 'Ubiquiti', '78:8a:20': 'Ubiquiti', 'fc:ec:da': 'Ubiquiti',
+  '18:e8:29': 'Ubiquiti', '74:ac:b9': 'Ubiquiti', '24:5a:4c': 'Ubiquiti',
+  '00:11:32': 'Synology', '00:1a:2b': 'QNAP',
+  '70:b3:d5': 'Emporia', 'b4:e6:2d': 'Emporia',
+  '00:40:ad': 'SMA Solar', 'c4:7c:8d': 'Enphase',
+  'b8:d7:af': 'Murata (IoT)', '2c:f4:32': 'Espressif (ESP)',
+  'a4:cf:12': 'Espressif (ESP)', '24:6f:28': 'Espressif (ESP)',
+  '60:01:94': 'Espressif (ESP)', '30:ae:a4': 'Espressif (ESP)',
+  '00:80:41': 'VoIP device', '00:04:f2': 'Polycom',
+  '00:1b:21': 'Intel', '3c:97:0e': 'Intel', '8c:8c:aa': 'Intel',
+  'b4:96:91': 'Intel',
+  '30:9c:23': 'Belkin/Wemo',
+  '34:ea:34': 'HiSilicon (camera)', '00:12:41': 'Amcrest',
+  '9c:8e:cd': 'Amcrest', 'e0:63:da': 'Reolink', '54:c0:de': 'Reolink',
+  '7c:dd:90': 'Shenzhen (generic IoT)', '78:11:dc': 'Xiaomi',
+  'f8:a4:5f': 'Xiaomi', '64:ce:d1': 'Xiaomi',
+  '00:1e:06': 'Wibrain (NUC)', 'b0:a7:37': 'Roku',
+}
+
+function lookupVendor(mac: string): string {
+  const prefix = mac.toLowerCase().slice(0, 8)
+  return MAC_VENDORS[prefix] || ''
+}
+
+// mDNS query to discover services on a device
+async function mdnsProbe(_ip: string): Promise<string[]> {
+  return new Promise(resolve => {
+    const services: string[] = []
+    try {
+      // Use dns-sd if available (macOS built-in)
+      const proc = spawn('dns-sd', ['-B', '_services._dns-sd._udp', 'local.'], {
+        timeout: 3000,
+      })
+      let output = ''
+      proc.stdout.on('data', d => { output += d.toString() })
+      setTimeout(() => {
+        proc.kill()
+        // Parse discovered service types
+        for (const line of output.split('\n')) {
+          const match = line.match(/(_\S+)\s+local\./)
+          if (match && !services.includes(match[1])) services.push(match[1])
+        }
+        resolve(services)
+      }, 2500)
+      proc.on('error', () => resolve([]))
+    } catch { resolve([]) }
+  })
+}
+
+// Full probe of a single IP
+ipcMain.handle('probe-device', async (_event, ip: string, mac?: string) => {
+  const result: {
+    ip: string
+    mac: string
+    vendor: string
+    ttl: number | null
+    osGuess: string
+    ports: { port: number; name: string; open: boolean; banner: string }[]
+    http: { port: number; server: string; title: string; redirectUrl: string; secure: boolean }[]
+    mdnsServices: string[]
+  } = {
+    ip,
+    mac: mac || '',
+    vendor: mac ? lookupVendor(mac) : '',
+    ttl: null,
+    osGuess: 'Unknown',
+    ports: [],
+    http: [],
+    mdnsServices: [],
+  }
+
+  // Step 1: TTL + OS guess
+  result.ttl = await getTTL(ip)
+  result.osGuess = guessOS(result.ttl)
+
+  // Step 2: Port scan (parallel, all common ports)
+  const portResults = await Promise.all(
+    PROBE_PORTS.map(async p => {
+      const r = await tcpProbe(ip, p.port)
+      return { port: p.port, name: p.name, open: r.open, banner: r.banner }
+    })
+  )
+  result.ports = portResults.filter(p => p.open)
+
+  // Step 3: HTTP fingerprint on open web ports
+  const webPorts = result.ports.filter(p =>
+    [80, 443, 8080, 8443, 3000, 5000, 8000, 9090, 32400].includes(p.port)
+  )
+  for (const wp of webPorts) {
+    const secure = [443, 8443].includes(wp.port)
+    const httpInfo = await httpProbe(ip, wp.port, secure)
+    if (httpInfo.server || httpInfo.title) {
+      result.http.push({ port: wp.port, secure, ...httpInfo })
+    }
+  }
+
+  // Step 4: mDNS (only if port 5353 is responsive or as general discovery)
+  if (result.ports.some(p => p.port === 5353) || result.ports.length > 0) {
+    result.mdnsServices = await mdnsProbe(ip)
+  }
+
+  return result
+})
+
+// Quick port scan — just check if ports are open, no fingerprinting
+ipcMain.handle('quick-scan', async (_event, ip: string) => {
+  const results = await Promise.all(
+    PROBE_PORTS.map(async p => {
+      const r = await tcpProbe(ip, p.port, 1000)
+      return r.open ? { port: p.port, name: p.name, banner: r.banner } : null
+    })
+  )
+  return results.filter(Boolean)
+})
+
+// Extended port list for deep scanning mystery devices
+const DEEP_PORTS: { port: number; name: string }[] = [
+  // All standard ports plus IoT, smart home, cameras, etc.
+  { port: 7, name: 'Echo' }, { port: 9, name: 'WOL' },
+  { port: 13, name: 'Daytime' }, { port: 17, name: 'QOTD' },
+  { port: 37, name: 'Time' }, { port: 42, name: 'WINS' },
+  { port: 49, name: 'TACACS' }, { port: 67, name: 'DHCP' },
+  { port: 68, name: 'DHCP Client' }, { port: 69, name: 'TFTP' },
+  { port: 79, name: 'Finger' }, { port: 81, name: 'HTTP Alt' },
+  { port: 88, name: 'Kerberos' }, { port: 110, name: 'POP3' },
+  { port: 111, name: 'RPC' }, { port: 119, name: 'NNTP' },
+  { port: 123, name: 'NTP' }, { port: 135, name: 'MSRPC' },
+  { port: 137, name: 'NetBIOS-NS' }, { port: 138, name: 'NetBIOS-DGM' },
+  { port: 139, name: 'NetBIOS-SSN' }, { port: 143, name: 'IMAP' },
+  { port: 161, name: 'SNMP' }, { port: 162, name: 'SNMP Trap' },
+  { port: 179, name: 'BGP' }, { port: 389, name: 'LDAP' },
+  { port: 427, name: 'SLP' }, { port: 443, name: 'HTTPS' },
+  { port: 500, name: 'IKE/VPN' }, { port: 515, name: 'LPD Print' },
+  { port: 520, name: 'RIP' }, { port: 546, name: 'DHCPv6' },
+  { port: 547, name: 'DHCPv6 Server' }, { port: 587, name: 'SMTP Sub' },
+  { port: 593, name: 'HTTP RPC' }, { port: 636, name: 'LDAPS' },
+  { port: 873, name: 'rsync' }, { port: 993, name: 'IMAPS' },
+  { port: 995, name: 'POP3S' }, { port: 1080, name: 'SOCKS' },
+  { port: 1194, name: 'OpenVPN' }, { port: 1433, name: 'MSSQL' },
+  { port: 1434, name: 'MSSQL Browser' }, { port: 1521, name: 'Oracle' },
+  { port: 1701, name: 'L2TP' }, { port: 1723, name: 'PPTP' },
+  { port: 1812, name: 'RADIUS' }, { port: 1900, name: 'SSDP/UPnP' },
+  { port: 2049, name: 'NFS' }, { port: 2082, name: 'cPanel' },
+  { port: 2083, name: 'cPanel SSL' }, { port: 2181, name: 'Zookeeper' },
+  { port: 2222, name: 'SSH Alt' }, { port: 2375, name: 'Docker' },
+  { port: 2376, name: 'Docker TLS' }, { port: 3128, name: 'Squid' },
+  { port: 3283, name: 'Apple Remote' }, { port: 3478, name: 'STUN' },
+  { port: 3689, name: 'iTunes/DAAP' }, { port: 4000, name: 'Thin' },
+  { port: 4040, name: 'Avahi' }, { port: 4443, name: 'HTTPS Alt' },
+  { port: 4500, name: 'IPSec NAT' }, { port: 4567, name: 'Sinatra' },
+  { port: 4713, name: 'PulseAudio' }, { port: 4786, name: 'Cisco Smart' },
+  { port: 5001, name: 'Synology' }, { port: 5004, name: 'RTP' },
+  { port: 5060, name: 'SIP' }, { port: 5222, name: 'XMPP' },
+  { port: 5269, name: 'XMPP S2S' }, { port: 5357, name: 'WSDAPI' },
+  { port: 5500, name: 'VNC Alt' }, { port: 5601, name: 'Kibana' },
+  { port: 5800, name: 'VNC HTTP' }, { port: 5901, name: 'VNC :1' },
+  { port: 6000, name: 'X11' }, { port: 6379, name: 'Redis' },
+  { port: 6443, name: 'K8s API' }, { port: 6667, name: 'IRC' },
+  { port: 6881, name: 'BitTorrent' }, { port: 7070, name: 'RealServer' },
+  { port: 7443, name: 'HTTPS Alt' }, { port: 7547, name: 'TR-069' },
+  { port: 8008, name: 'HTTP Alt' }, { port: 8009, name: 'AJP' },
+  { port: 8081, name: 'HTTP Alt' }, { port: 8088, name: 'HTTP Alt' },
+  { port: 8123, name: 'Home Asst' }, { port: 8181, name: 'HTTP Alt' },
+  { port: 8200, name: 'GoToMyPC' }, { port: 8291, name: 'MikroTik' },
+  { port: 8443, name: 'HTTPS Alt' }, { port: 8444, name: 'HTTPS Alt' },
+  { port: 8500, name: 'Consul' }, { port: 8545, name: 'Ethereum' },
+  { port: 8728, name: 'MikroTik API' }, { port: 8834, name: 'Nessus' },
+  { port: 8888, name: 'HTTP Alt' }, { port: 9000, name: 'Portainer' },
+  { port: 9001, name: 'ETH/Tor' }, { port: 9043, name: 'WebSphere' },
+  { port: 9080, name: 'HTTP Alt' }, { port: 9091, name: 'Transmission' },
+  { port: 9200, name: 'Elasticsearch' }, { port: 9300, name: 'ES Transport' },
+  { port: 9443, name: 'HTTPS Alt' }, { port: 9876, name: 'Mondorescue' },
+  { port: 9999, name: 'Urchin' }, { port: 10000, name: 'Webmin' },
+  { port: 10001, name: 'Ubiquiti Disc' }, { port: 10243, name: 'MS WSUS' },
+  { port: 11211, name: 'Memcached' }, { port: 12345, name: 'NetBus' },
+  { port: 15672, name: 'RabbitMQ' }, { port: 16992, name: 'Intel AMT' },
+  { port: 16993, name: 'Intel AMT TLS' }, { port: 17000, name: 'Cassia Hub' },
+  { port: 18080, name: 'HTTP Alt' }, { port: 19132, name: 'Minecraft BE' },
+  { port: 20000, name: 'DNP3' }, { port: 25565, name: 'Minecraft' },
+  { port: 27017, name: 'MongoDB' }, { port: 28017, name: 'MongoDB Web' },
+  { port: 30303, name: 'Ethereum P2P' }, { port: 32469, name: 'Plex DLNA' },
+  { port: 37215, name: 'Huawei HG' }, { port: 37777, name: 'Dahua Cam' },
+  { port: 44818, name: 'EtherNet/IP' }, { port: 47808, name: 'BACnet' },
+  { port: 49153, name: 'UPnP' }, { port: 49154, name: 'UPnP' },
+  { port: 50000, name: 'SAP' }, { port: 51820, name: 'WireGuard' },
+  { port: 55442, name: 'Reolink' }, { port: 55443, name: 'Reolink HTTPS' },
+  { port: 56790, name: 'IoT Misc' },
+]
+
+// Combine both port lists, deduplicate
+function getAllPorts() {
+  const seen = new Set<number>()
+  const all: { port: number; name: string }[] = []
+  for (const p of PROBE_PORTS) {
+    if (!seen.has(p.port)) { seen.add(p.port); all.push({ port: p.port, name: p.name }) }
+  }
+  for (const p of DEEP_PORTS) {
+    if (!seen.has(p.port)) { seen.add(p.port); all.push({ port: p.port, name: p.name }) }
+  }
+  return all.sort((a, b) => a.port - b.port)
+}
+
+// Try to get more info about a device via ARP, nbtscan, SSDP
+async function deepIdentify(ip: string, _mac: string): Promise<{
+  netbiosName: string
+  ssdpInfo: string
+  arpType: string
+  reverseDns: string
+}> {
+  const result = { netbiosName: '', ssdpInfo: '', arpType: '', reverseDns: '' }
+
+  // Reverse DNS
+  try {
+    const { stdout } = await execAsync(`host ${ip} 2>/dev/null`, { timeout: 3000 })
+    const match = stdout.match(/pointer\s+(.+)\.?$/)
+    if (match) result.reverseDns = match[1].replace(/\.$/, '')
+  } catch {}
+
+  // ARP entry type (check if it's static, dynamic, etc.)
+  try {
+    const { stdout } = await execAsync(`arp -n ${ip} 2>/dev/null`, { timeout: 2000 })
+    if (stdout.includes('permanent')) result.arpType = 'permanent'
+    else if (stdout.includes('(incomplete)')) result.arpType = 'incomplete'
+    else result.arpType = 'dynamic'
+  } catch {}
+
+  // SSDP M-SEARCH for UPnP device description
+  try {
+    const ssdp = await new Promise<string>((resolve) => {
+      const dgram = require('node:dgram') as typeof import('node:dgram')
+      const socket = dgram.createSocket('udp4')
+      const msg = Buffer.from(
+        'M-SEARCH * HTTP/1.1\r\n' +
+        `HOST: ${ip}:1900\r\n` +
+        'MAN: "ssdp:discover"\r\n' +
+        'MX: 2\r\n' +
+        'ST: ssdp:all\r\n\r\n'
+      )
+      let response = ''
+      const timer = setTimeout(() => { socket.close(); resolve(response) }, 3000)
+      socket.on('message', (data) => {
+        response += data.toString()
+      })
+      socket.on('error', () => { clearTimeout(timer); socket.close(); resolve('') })
+      socket.send(msg, 0, msg.length, 1900, ip)
+    })
+    if (ssdp) {
+      const serverMatch = ssdp.match(/SERVER:\s*(.+)/i)
+      const locMatch = ssdp.match(/LOCATION:\s*(.+)/i)
+      const parts: string[] = []
+      if (serverMatch) parts.push(serverMatch[1].trim())
+      if (locMatch) parts.push(locMatch[1].trim())
+      result.ssdpInfo = parts.join(' | ')
+    }
+  } catch {}
+
+  return result
+}
+
+// Deep probe — extended port range + extra identification
+ipcMain.handle('deep-probe-device', async (_event, ip: string, mac?: string) => {
+  const allPorts = getAllPorts()
+
+  const result: {
+    ip: string
+    mac: string
+    vendor: string
+    ttl: number | null
+    osGuess: string
+    ports: { port: number; name: string; open: boolean; banner: string }[]
+    http: { port: number; server: string; title: string; redirectUrl: string; secure: boolean }[]
+    mdnsServices: string[]
+    netbiosName: string
+    ssdpInfo: string
+    arpType: string
+    reverseDns: string
+  } = {
+    ip,
+    mac: mac || '',
+    vendor: mac ? lookupVendor(mac) : '',
+    ttl: null,
+    osGuess: 'Unknown',
+    ports: [],
+    http: [],
+    mdnsServices: [],
+    netbiosName: '',
+    ssdpInfo: '',
+    arpType: '',
+    reverseDns: '',
+  }
+
+  // TTL + OS
+  result.ttl = await getTTL(ip)
+  result.osGuess = guessOS(result.ttl)
+
+  // Deep identification (reverse DNS, SSDP, ARP type) in parallel with port scan
+  const [deepId, portResults] = await Promise.all([
+    deepIdentify(ip, mac || ''),
+    // Scan all ports in batches of 50 to avoid overwhelming
+    (async () => {
+      const results: { port: number; name: string; open: boolean; banner: string }[] = []
+      for (let i = 0; i < allPorts.length; i += 50) {
+        const batch = allPorts.slice(i, i + 50)
+        const batchResults = await Promise.all(
+          batch.map(async p => {
+            const r = await tcpProbe(ip, p.port, 1200)
+            return { port: p.port, name: p.name, open: r.open, banner: r.banner }
+          })
+        )
+        results.push(...batchResults.filter(p => p.open))
+      }
+      return results
+    })(),
+  ])
+
+  Object.assign(result, deepId)
+  result.ports = portResults
+
+  // HTTP fingerprint open web ports
+  const webPorts = result.ports.filter(p =>
+    [80, 81, 443, 3000, 4443, 5000, 5001, 7443, 8000, 8008, 8080, 8081, 8088, 8123,
+     8181, 8200, 8443, 8444, 8888, 9000, 9080, 9090, 9443, 10000, 18080, 32400].includes(p.port)
+  )
+  for (const wp of webPorts) {
+    const secure = [443, 4443, 5001, 7443, 8443, 8444, 9443].includes(wp.port)
+    const httpInfo = await httpProbe(ip, wp.port, secure)
+    if (httpInfo.server || httpInfo.title) {
+      result.http.push({ port: wp.port, secure, ...httpInfo })
+    }
+  }
+
+  // mDNS
+  result.mdnsServices = await mdnsProbe(ip)
+
+  return result
+})
+
+// Deep scan ALL online devices — probes each one sequentially, sends progress updates
+ipcMain.handle('deep-scan-all', async (_event, devices: { ip: string; mac: string }[]) => {
+  const results: Record<string, any> = {}
+  for (let i = 0; i < devices.length; i++) {
+    const d = devices[i]
+    win?.webContents.send('deep-scan-progress', { current: i + 1, total: devices.length, ip: d.ip })
+    try {
+      // Use the standard probe (not the extended deep one) for speed when scanning all
+      const ttl = await getTTL(d.ip)
+      const portResults = await Promise.all(
+        PROBE_PORTS.map(async p => {
+          const r = await tcpProbe(d.ip, p.port, 1000)
+          return r.open ? { port: p.port, name: p.name, open: true, banner: r.banner } : null
+        })
+      )
+      const openPorts = portResults.filter(Boolean) as { port: number; name: string; open: boolean; banner: string }[]
+
+      // Quick HTTP fingerprint on web ports
+      const httpResults: { port: number; server: string; title: string; redirectUrl: string; secure: boolean }[] = []
+      for (const p of openPorts.filter(p => [80, 443, 8080, 8443, 8000, 5000, 32400].includes(p.port))) {
+        const secure = [443, 8443].includes(p.port)
+        const h = await httpProbe(d.ip, p.port, secure)
+        if (h.server || h.title) httpResults.push({ port: p.port, secure, ...h })
+      }
+
+      results[d.ip] = {
+        ip: d.ip,
+        mac: d.mac,
+        vendor: lookupVendor(d.mac),
+        ttl,
+        osGuess: guessOS(ttl),
+        ports: openPorts,
+        http: httpResults,
+        mdnsServices: [],
+        netbiosName: '',
+        ssdpInfo: '',
+        arpType: '',
+        reverseDns: '',
+      }
+    } catch {}
+  }
+  return results
+})
+
+// --- Life360 API ---
+const LIFE360_BASE = 'https://www.life360.com'
+let life360Token: string | null = null
+
+async function life360Fetch(endpoint: string): Promise<any> {
+  if (!life360Token) throw new Error('Not authenticated')
+
+  const headers: Record<string, string> = { 'Accept': 'application/json' }
+
+  if (life360Token === '__cookie_auth__') {
+    // Use cookies from the webview session
+    const life360Session = session.fromPartition('persist:life360')
+    const cookies = await life360Session.cookies.get({ domain: '.life360.com' })
+    headers['Cookie'] = cookies.map(c => `${c.name}=${c.value}`).join('; ')
+  } else {
+    headers['Authorization'] = `Bearer ${life360Token}`
+  }
+
+  return new Promise((resolve, reject) => {
+    const url = new URL(endpoint, LIFE360_BASE)
+    const req = https.request(url, { headers }, res => {
+      let data = ''
+      res.on('data', c => data += c)
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)) } catch { resolve(data) }
+      })
+    })
+    req.on('error', reject)
+    req.end()
+  })
+}
+
+ipcMain.handle('life360-check-session', () => {
+  try {
+    const p = path.join(app.getPath('userData'), 'life360-token.json')
+    if (fs.existsSync(p)) {
+      const saved = JSON.parse(fs.readFileSync(p, 'utf-8'))
+      if (saved.token) {
+        life360Token = saved.token
+        return true
+      }
+    }
+  } catch {}
+  return false
+})
+
+// Intercept Life360 webview token responses
+app.whenReady().then(() => {
+  const life360Session = session.fromPartition('persist:life360')
+  life360Session.webRequest.onCompleted({
+    urls: ['https://www.life360.com/v3/oauth2/token*', 'https://api.life360.com/v3/oauth2/token*']
+  }, (details) => {
+    if (details.statusCode === 200 && details.method === 'POST') {
+      // Token endpoint was hit successfully — now fetch it via the webview's cookies/response
+      // We need to read the response body. Since onCompleted doesn't give us the body,
+      // we use a different approach: intercept via debugger or just watch for Bearer headers
+    }
+  })
+
+  // Watch for any authenticated API requests to grab the Bearer token
+  life360Session.webRequest.onBeforeSendHeaders({
+    urls: ['https://www.life360.com/v3/*', 'https://api.life360.com/v3/*']
+  }, (details, callback) => {
+    const authHeader = details.requestHeaders['Authorization'] || details.requestHeaders['authorization']
+    if (authHeader && authHeader.startsWith('Bearer ') && !life360Token) {
+      const token = authHeader.replace('Bearer ', '')
+      life360Token = token
+      fs.writeFileSync(
+        path.join(app.getPath('userData'), 'life360-token.json'),
+        JSON.stringify({ token })
+      )
+      win?.webContents.send('life360-token-captured', token)
+    }
+    callback({ requestHeaders: details.requestHeaders })
+  })
+})
+
+// Extract token from Life360 webview session cookies or by making an API call
+ipcMain.handle('life360-extract-token', async () => {
+  try {
+    const life360Session = session.fromPartition('persist:life360')
+    const cookies = await life360Session.cookies.get({ domain: '.life360.com' })
+
+    // Look for auth-related cookies
+    const tokenCookie = cookies.find(c =>
+      c.name.toLowerCase().includes('token') ||
+      c.name.toLowerCase().includes('auth') ||
+      c.name.toLowerCase().includes('session') ||
+      c.name === 'access_token'
+    )
+
+    if (tokenCookie) {
+      life360Token = tokenCookie.value
+      fs.writeFileSync(
+        path.join(app.getPath('userData'), 'life360-token.json'),
+        JSON.stringify({ token: tokenCookie.value })
+      )
+      return { ok: true, token: tokenCookie.value }
+    }
+
+    // If no obvious token cookie, try making an API call using the session cookies
+    // The webview is authenticated, so we can fetch via the session
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ')
+
+    // Try to get circles using cookie auth
+    const result: any = await new Promise((resolve, reject) => {
+      const url = new URL('/v3/circles', LIFE360_BASE)
+      const req = https.request(url, {
+        headers: {
+          'Cookie': cookieHeader,
+          'Accept': 'application/json',
+        },
+      }, res => {
+        let data = ''
+        res.on('data', c => data += c)
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)) } catch { resolve({ raw: data }) }
+        })
+      })
+      req.on('error', reject)
+      req.end()
+    })
+
+    // If cookie auth works, we can use cookies directly
+    if (result.circles) {
+      life360Token = '__cookie_auth__'
+      fs.writeFileSync(
+        path.join(app.getPath('userData'), 'life360-token.json'),
+        JSON.stringify({ token: '__cookie_auth__', cookies: cookieHeader })
+      )
+      return { ok: true, mode: 'cookie' }
+    }
+
+    // Return cookie names for debugging
+    return { error: 'No token found', cookieNames: cookies.map(c => c.name) }
+  } catch (e: any) {
+    return { error: e.message }
+  }
+})
+
+ipcMain.handle('life360-save-token', (_event, token: string) => {
+  life360Token = token
+  fs.writeFileSync(
+    path.join(app.getPath('userData'), 'life360-token.json'),
+    JSON.stringify({ token })
+  )
+})
+
+ipcMain.handle('life360-logout', () => {
+  life360Token = null
+  const p = path.join(app.getPath('userData'), 'life360-token.json')
+  if (fs.existsSync(p)) fs.unlinkSync(p)
+})
+
+ipcMain.handle('life360-circles', async () => {
+  try {
+    const data = await life360Fetch('/v3/circles')
+    console.log('life360 /v3/circles raw:', JSON.stringify(data).slice(0, 500))
+
+    if (!data.circles) return { error: 'No circles key in response', raw: JSON.stringify(data).slice(0, 300) }
+
+    // For each circle, fetch members
+    const results = []
+    for (const c of data.circles) {
+      const detail = await life360Fetch(`/v3/circles/${c.id}`)
+      results.push({
+        id: c.id,
+        name: c.name,
+        memberCount: c.memberCount,
+        members: detail.members || [],
+      })
+    }
+    return results
+  } catch (e: any) {
+    return { error: e.message }
+  }
+})
+
+// --- Detach module into its own window ---
+ipcMain.handle('detach-module', (_event, moduleId: string) => {
+  const child = new BrowserWindow({
+    width: 800,
+    height: 600,
+    backgroundColor: '#080808',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.mjs'),
+      webviewTag: true,
+    },
+  })
+  const url = VITE_DEV_SERVER_URL
+    ? `${VITE_DEV_SERVER_URL}#/module/${moduleId}`
+    : `file://${path.join(RENDERER_DIST, 'index.html')}#/module/${moduleId}`
+  child.loadURL(url)
 })
 
 ipcMain.handle('load-target-history', () => {
@@ -991,5 +1720,248 @@ ipcMain.handle('clock-send', (_e, ip: string, endpoint: string) => {
       res.on('end', () => resolve(true))
     }).on('error', () => resolve(false)).on('timeout', () => resolve(false))
   })
+})
+
+// ── Emporia Energy Monitor ──────────────────────────────────────────────────
+
+// Cognito pool: us-east-2_ghlOXVLi1
+const EMPORIA_COGNITO_CLIENT = '4qte47jbstod8apnfic0bunmrq'
+const EMPORIA_API = 'https://api.emporiaenergy.com'
+
+let emporiaTokens: { idToken: string; accessToken: string; refreshToken: string; expiresAt: number } | null = null
+let emporiaDevices: { deviceGid: number; name: string; channels: { channelNum: string; name: string; channelMultiplier: number; type: string }[] }[] = []
+
+function emporiaConfigPath() { return path.join(app.getPath('userData'), 'emporia-config.json') }
+
+ipcMain.handle('emporia-load-config', () => {
+  try {
+    const p = emporiaConfigPath()
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, 'utf-8'))
+      return { email: data.email, hasPassword: !!data.password }
+    }
+  } catch {}
+  return null
+})
+
+ipcMain.handle('emporia-login', async (_e, email: string, password: string) => {
+  try {
+    // Authenticate via AWS Cognito USER_PASSWORD_AUTH
+    const authPayload = JSON.stringify({
+      AuthParameters: { USERNAME: email, PASSWORD: password },
+      AuthFlow: 'USER_PASSWORD_AUTH',
+      ClientId: EMPORIA_COGNITO_CLIENT,
+    })
+
+    const authResult: any = await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'cognito-idp.us-east-2.amazonaws.com',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-amz-json-1.1',
+          'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth',
+        },
+      }, res => {
+        let data = ''
+        res.on('data', (c: Buffer) => { data += c.toString() })
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data)
+            if (res.statusCode === 200) resolve(parsed)
+            else reject(new Error(parsed.message || parsed.__type || 'Auth failed'))
+          } catch { reject(new Error('Invalid response')) }
+        })
+      })
+      req.on('error', reject)
+      req.write(authPayload)
+      req.end()
+    })
+
+    const result = authResult.AuthenticationResult
+    if (!result) throw new Error('No auth result')
+
+    emporiaTokens = {
+      idToken: result.IdToken,
+      accessToken: result.AccessToken,
+      refreshToken: result.RefreshToken,
+      expiresAt: Date.now() + (result.ExpiresIn * 1000),
+    }
+
+    // Save credentials (encrypted)
+    const config = { email, password: encryptPw(password) }
+    fs.writeFileSync(emporiaConfigPath(), JSON.stringify(config, null, 2))
+
+    // Fetch devices
+    await emporiaFetchDevices()
+    return { success: true, devices: emporiaDevices }
+  } catch (err: any) {
+    return { success: false, error: err.message || 'Login failed' }
+  }
+})
+
+ipcMain.handle('emporia-auto-login', async () => {
+  try {
+    const p = emporiaConfigPath()
+    if (!fs.existsSync(p)) return { success: false, error: 'No saved credentials' }
+    const data = JSON.parse(fs.readFileSync(p, 'utf-8'))
+    if (!data.email || !data.password) return { success: false, error: 'Missing credentials' }
+    const password = decryptPw(data.password)
+
+    // Reuse existing tokens if still valid
+    if (emporiaTokens && Date.now() < emporiaTokens.expiresAt - 60000) {
+      if (emporiaDevices.length === 0) await emporiaFetchDevices()
+      return { success: true, devices: emporiaDevices }
+    }
+
+    // Re-authenticate
+    const authPayload = JSON.stringify({
+      AuthParameters: { USERNAME: data.email, PASSWORD: password },
+      AuthFlow: 'USER_PASSWORD_AUTH',
+      ClientId: EMPORIA_COGNITO_CLIENT,
+    })
+
+    const authResult: any = await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'cognito-idp.us-east-2.amazonaws.com',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-amz-json-1.1',
+          'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth',
+        },
+      }, res => {
+        let d = ''
+        res.on('data', (c: Buffer) => { d += c.toString() })
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(d)
+            if (res.statusCode === 200) resolve(parsed)
+            else reject(new Error(parsed.message || 'Auth failed'))
+          } catch { reject(new Error('Invalid response')) }
+        })
+      })
+      req.on('error', reject)
+      req.write(authPayload)
+      req.end()
+    })
+
+    const auth = authResult.AuthenticationResult
+    if (!auth) throw new Error('No auth result')
+
+    emporiaTokens = {
+      idToken: auth.IdToken,
+      accessToken: auth.AccessToken,
+      refreshToken: auth.RefreshToken || emporiaTokens?.refreshToken || '',
+      expiresAt: Date.now() + (auth.ExpiresIn * 1000),
+    }
+
+    await emporiaFetchDevices()
+    return { success: true, devices: emporiaDevices }
+  } catch (err: any) {
+    return { success: false, error: err.message || 'Auto-login failed' }
+  }
+})
+
+function emporiaApiGet(endpoint: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!emporiaTokens) return reject(new Error('Not authenticated'))
+    const url = new URL(endpoint, EMPORIA_API)
+    https.get(url, {
+      headers: { 'authtoken': emporiaTokens.idToken },
+    }, res => {
+      let data = ''
+      res.on('data', (c: Buffer) => { data += c.toString() })
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)) }
+        catch { reject(new Error('Invalid JSON')) }
+      })
+    }).on('error', reject)
+  })
+}
+
+async function emporiaFetchDevices() {
+  const data = await emporiaApiGet('/customers/devices')
+  if (data?.devices) {
+    emporiaDevices = data.devices.map((d: any) => ({
+      deviceGid: d.deviceGid,
+      name: d.locationProperties?.deviceName || d.model || `Device ${d.deviceGid}`,
+      channels: (d.devices || []).concat([d]).flatMap((sub: any) =>
+        (sub.channels || []).map((ch: any) => ({
+          channelNum: ch.channelNum,
+          name: ch.name || ch.channelNum,
+          channelMultiplier: ch.channelMultiplier || 1,
+          type: ch.type || '',
+        }))
+      ),
+    }))
+  }
+}
+
+ipcMain.handle('emporia-get-usage', async (_e, scale?: string) => {
+  try {
+    if (!emporiaTokens || !emporiaDevices.length) return null
+
+    // Ensure tokens are fresh
+    if (Date.now() >= emporiaTokens.expiresAt - 60000) {
+      }
+
+    const gids = emporiaDevices.map(d => d.deviceGid).join('+')
+    const now = new Date()
+    const instant = now.toISOString()
+    const s = scale || '1S'
+
+    const data = await emporiaApiGet(
+      `/AppAPI?apiMethod=getDeviceListUsages&deviceGids=${gids}&instant=${instant}&scale=${s}&energyUnit=KilowattHours`
+    )
+    return data
+  } catch (err: any) {
+    return { error: err.message }
+  }
+})
+
+ipcMain.handle('emporia-get-chart', async (_e, scale: string, days: number) => {
+  try {
+    if (!emporiaTokens || !emporiaDevices.length) return null
+    const now = new Date()
+    const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000)
+    // Get chart data for each device and combine
+    const results: { gid: number; name: string; usageList: number[]; firstInstant: string }[] = []
+    for (const dev of emporiaDevices) {
+      const data = await emporiaApiGet(
+        `/AppAPI?apiMethod=getChartUsage&deviceGid=${dev.deviceGid}&channel=1,2,3&start=${start.toISOString()}&end=${now.toISOString()}&scale=${scale}&energyUnit=KilowattHours`
+      )
+      if (data?.usageList) {
+        results.push({
+          gid: dev.deviceGid,
+          name: dev.name,
+          usageList: data.usageList,
+          firstInstant: data.firstUsageInstant,
+        })
+      }
+    }
+    // Combine both panels into one total array
+    if (results.length === 0) return null
+    const maxLen = Math.max(...results.map(r => r.usageList.length))
+    const combined: number[] = []
+    for (let i = 0; i < maxLen; i++) {
+      let sum = 0
+      for (const r of results) {
+        const v = r.usageList[i]
+        if (v != null) sum += v
+      }
+      combined.push(sum)
+    }
+    return { usageList: combined, firstInstant: results[0].firstInstant, scale }
+  } catch (err: any) {
+    return { error: err.message }
+  }
+})
+
+ipcMain.handle('emporia-get-devices', () => emporiaDevices)
+
+ipcMain.handle('emporia-logout', () => {
+  emporiaTokens = null
+  emporiaDevices = []
+  try { fs.unlinkSync(emporiaConfigPath()) } catch {}
+  return true
 })
 

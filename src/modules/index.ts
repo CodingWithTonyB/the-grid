@@ -13,6 +13,10 @@ import SystemMonitorMeta from './SystemMonitor/meta'
 import SystemMonitor from './SystemMonitor'
 import ClockMeta from './Clock/meta'
 import Clock from './Clock'
+import EnergyMonitorMeta from './EnergyMonitor/meta'
+import EnergyMonitor from './EnergyMonitor'
+import Life360Meta from './Life360/meta'
+import Life360 from './Life360'
 
 export interface Module {
   id: string
@@ -29,6 +33,8 @@ const modules: Module[] = [
   { ...SpeedTestMeta, component: SpeedTest },
   { ...SystemMonitorMeta, component: SystemMonitor },
   { ...ClockMeta, component: Clock },
+  { ...EnergyMonitorMeta, component: EnergyMonitor },
+  { ...Life360Meta, component: Life360 },
 ]
 
 export default modules

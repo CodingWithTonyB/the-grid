@@ -268,9 +268,14 @@
         })
       }
 
-      window.__splashStart = Date.now()
-      window.__splashLog('boot :: initializing the grid')
-      window.__splashLog('boot :: loading electron preload')
+      // Skip splash entirely for detached module windows
+      if (window.location.hash.indexOf('#/module/') === 0) {
+        document.getElementById('splash').remove()
+      } else {
+        window.__splashStart = Date.now()
+        window.__splashLog('boot :: initializing the grid')
+        window.__splashLog('boot :: loading electron preload')
+      }
     </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>

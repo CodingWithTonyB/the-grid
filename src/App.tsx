@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 import modules, { Module } from './modules'
 
@@ -10,20 +10,92 @@ function defaultLayout(): GridItem[] {
   return modules.map(m => ({ type: 'module' as const, id: m.id }))
 }
 
-const log = (window as any).__splashLog || (() => {})
+// const log = (window as any).__splashLog || (() => {})
 
-function App({ onReady }: { onReady?: () => void }) {
-  const [active, setActive] = useState<Module | null>(null)
-  const [layout, setLayout] = useState<GridItem[]>(defaultLayout)
+// ── Split layout types ──────────────────────────────────────
+type SplitDir = 'h' | 'v'
+interface SplitState {
+  dir: SplitDir
+  sizes: [number, number]
+  children: [LayoutState, LayoutState]
+}
+interface PaneState {
+  type: 'single'
+  openModuleId: string | null  // null = show grid
+}
+type LayoutState = PaneState | SplitState
+
+function isSplit(s: LayoutState): s is SplitState { return 'dir' in s }
+
+// ── Resize handle ───────────────────────────────────────────
+function ResizeHandle({ dir, onResize }: { dir: SplitDir; onResize: (delta: number) => void }) {
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    let last = dir === 'h' ? e.clientX : e.clientY
+    const onMove = (ev: MouseEvent) => {
+      const pos = dir === 'h' ? ev.clientX : ev.clientY
+      onResize(pos - last)
+      last = pos
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    document.body.style.cursor = dir === 'h' ? 'col-resize' : 'row-resize'
+    document.body.style.userSelect = 'none'
+  }, [dir, onResize])
+
+  return <div className={`split-handle split-handle--${dir}`} onMouseDown={onMouseDown} />
+}
+
+// ── Detached single-module window ───────────────────────────
+function DetachedModuleView({ moduleId }: { moduleId: string }) {
+  const mod = modules.find(m => m.id === moduleId)
+  if (!mod) return <div className="council"><div className="empty-state">Module not found: {moduleId}</div></div>
+  const Comp = mod.component
+  return (
+    <div className="council council--detached">
+      <div className="header"><div className="page-title">{mod.name.toUpperCase()}</div></div>
+      <div className="divider" />
+      <Comp />
+    </div>
+  )
+}
+
+// ── Single pane — a full independent app instance ───────────
+function AppPane({ initialModuleId, layout, archived, showArchive, onSplit, onClose, isInSplit, getLabel, archiveModule, unarchiveModule, setShowArchive }: {
+  initialModuleId: string | null
+  layout: GridItem[]
+  archived: string[]
+  showArchive: boolean
+  onSplit: (dir: SplitDir, moduleId: string) => void
+  onClose: (() => void) | null
+  isInSplit: boolean
+  getLabel: (id: string, defaultName: string, defaultDesc: string) => { name: string; desc: string }
+  archiveModule: (id: string) => void
+  unarchiveModule: (id: string) => void
+  setShowArchive: (v: boolean) => void
+}) {
+  const [active, setActive] = useState<Module | null>(
+    initialModuleId ? modules.find(m => m.id === initialModuleId) ?? null : null
+  )
   const [openFolder, setOpenFolder] = useState<FolderItem | null>(null)
-
-  // View transition state
   const [viewPhase, setViewPhase] = useState<'idle' | 'exit' | 'enter'>('idle')
-  const pendingAction = useRef<() => void>(() => {})
+
+  // Drag state
+  const [dragIdx, setDragIdx] = useState<number | null>(null)
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null)
+  const [folderDragIdx, setFolderDragIdx] = useState<number | null>(null)
+  const [folderHoverIdx, setFolderHoverIdx] = useState<number | null>(null)
+  const [edgeHover, setEdgeHover] = useState<'left' | 'right' | 'top' | 'bottom' | null>(null)
+  const didDrag = useRef(false)
 
   function transitionTo(action: () => void) {
     setViewPhase('exit')
-    pendingAction.current = action
     setTimeout(() => {
       action()
       setViewPhase('enter')
@@ -31,244 +103,107 @@ function App({ onReady }: { onReady?: () => void }) {
     }, 200)
   }
 
-  function openModule(mod: Module) {
-    transitionTo(() => setActive(mod))
-  }
+  function openModule(mod: Module) { transitionTo(() => setActive(mod)) }
+  function closeToGrid() { transitionTo(() => { setActive(null); setOpenFolder(null) }) }
+  function openFolderView(folder: FolderItem) { transitionTo(() => setOpenFolder(folder)) }
+  function closeFolderView() { transitionTo(() => setOpenFolder(null)) }
 
-  function closeToGrid() {
-    transitionTo(() => { setActive(null); setOpenFolder(null) })
-  }
-
-  function openFolderView(folder: FolderItem) {
-    transitionTo(() => setOpenFolder(folder))
-  }
-
-  function closeFolderView() {
-    transitionTo(() => setOpenFolder(null))
-  }
-
-  // Main grid drag state
-  const [dragIdx, setDragIdx] = useState<number | null>(null)
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null)
-
-  // Folder interior drag state
-  const [folderDragIdx, setFolderDragIdx] = useState<number | null>(null)
-  const [folderHoverIdx, setFolderHoverIdx] = useState<number | null>(null)
-
-  const [creatingFolder, setCreatingFolder] = useState(false)
-  const [folderName, setFolderName] = useState('')
-  const didDrag = useRef(false)
-
-  // Rename
-  type Labels = Record<string, { name: string; desc: string }>
-  const [labels, setLabels] = useState<Labels>({})
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editName, setEditName] = useState('')
-  const [editDesc, setEditDesc] = useState('')
-
-  useEffect(() => {
-    log('app :: loading module labels')
-    window.ipcRenderer.invoke('load-module-labels').then((saved: Labels) => {
-      if (saved) {
-        setLabels(saved)
-        log(`app :: loaded ${Object.keys(saved).length} custom labels`)
-      }
-    })
-  }, [])
-
-  function getLabel(id: string, defaultName: string, defaultDesc: string) {
-    return {
-      name: labels[id]?.name ?? defaultName,
-      desc: labels[id]?.desc ?? defaultDesc,
-    }
-  }
-
-  function startEdit(e: React.MouseEvent, id: string, name: string, desc: string) {
-    e.stopPropagation()
-    setEditingId(id)
-    setEditName(name)
-    setEditDesc(desc)
-  }
-
-  function saveEdit() {
-    if (!editingId) return
-    const next = { ...labels, [editingId]: { name: editName.trim() || editName, desc: editDesc } }
-    setLabels(next)
-    window.ipcRenderer.invoke('save-module-labels', next)
-    setEditingId(null)
-  }
-
-  function cancelEdit() { setEditingId(null) }
-
-  useEffect(() => {
-    log('app :: loading grid layout')
-    log(`app :: ${modules.length} modules registered`)
-    window.ipcRenderer.invoke('load-layout').then((saved: GridItem[] | null) => {
-      if (!saved || !Array.isArray(saved)) {
-        log('app :: using default layout')
-      } else {
-        const allIds = new Set<string>()
-        saved.forEach(item => {
-          allIds.add(item.id)
-          if (item.type === 'folder') item.children.forEach(id => allIds.add(id))
-        })
-        const newMods = modules
-          .filter(m => !allIds.has(m.id))
-          .map(m => ({ type: 'module' as const, id: m.id }))
-        setLayout([...saved, ...newMods])
-        const folders = saved.filter(i => i.type === 'folder').length
-        log(`app :: layout restored — ${saved.length} items, ${folders} folders`)
-      }
-      onReady?.()
-    })
-  }, [])
-
-  function saveLayout(next: GridItem[]) {
-    setLayout(next)
-    window.ipcRenderer.invoke('save-layout', next)
-    if (openFolder) {
-      const updated = next.find(i => i.id === openFolder.id) as FolderItem | undefined
-      if (updated) setOpenFolder(updated)
-    }
-  }
-
-  // ── Main grid drag ──────────────────────────────────────────
+  // Grid drag
   function onDragStart(e: React.DragEvent, idx: number) {
-    didDrag.current = false
-    setDragIdx(idx)
-    e.dataTransfer.effectAllowed = 'move'
+    didDrag.current = false; setDragIdx(idx); e.dataTransfer.effectAllowed = 'move'
   }
-
-  function onDragOver(e: React.DragEvent, idx: number) {
-    e.preventDefault()
-    setHoverIdx(idx)
-  }
+  function onDragOver(e: React.DragEvent, idx: number) { e.preventDefault(); setHoverIdx(idx) }
+  function resetDrag() { setDragIdx(null); setHoverIdx(null); requestAnimationFrame(() => { didDrag.current = false }) }
 
   function onDrop(e: React.DragEvent, dropIdx: number) {
     e.preventDefault()
     if (dragIdx === null) { resetDrag(); return }
-
-    const dragItem = layout[dragIdx]
-    const dropItem = layout[dropIdx]
-
-    // Drop a module onto a folder → move it inside
-    if (dragItem.type === 'module' && dropItem.type === 'folder' && dragIdx !== dropIdx) {
-      const next = layout.filter((_, i) => i !== dragIdx) as GridItem[]
-      const folder = next.find(i => i.id === dropItem.id) as FolderItem
-      if (!folder.children.includes(dragItem.id)) {
-        folder.children = [...folder.children, dragItem.id]
-      }
-      didDrag.current = true
-      saveLayout(next)
-      resetDrag()
-      return
-    }
-
     if (dragIdx === dropIdx) { resetDrag(); return }
-
-    // Reorder
-    const next = [...layout]
-    const [item] = next.splice(dragIdx, 1)
-    const at = Math.max(0, Math.min(dropIdx > dragIdx ? dropIdx - 1 : dropIdx, next.length))
-    next.splice(at, 0, item)
     didDrag.current = true
-    saveLayout(next)
     resetDrag()
   }
 
-  function resetDrag() {
-    setDragIdx(null)
-    setHoverIdx(null)
-    requestAnimationFrame(() => { didDrag.current = false })
+  function onEdgeDrop(edge: 'left' | 'right' | 'top' | 'bottom') {
+    if (dragIdx === null) return
+    const item = layout[dragIdx]
+    if (item?.type !== 'module') return
+    const dir: SplitDir = (edge === 'left' || edge === 'right') ? 'h' : 'v'
+    onSplit(dir, item.id)
+    setEdgeHover(null)
+    resetDrag()
   }
 
-  // ── Folder interior drag ────────────────────────────────────
-  function onFolderDragStart(e: React.DragEvent, idx: number) {
-    setFolderDragIdx(idx)
-    e.dataTransfer.effectAllowed = 'move'
-  }
-
-  function onFolderDragOver(e: React.DragEvent, idx: number) {
-    e.preventDefault()
-    setFolderHoverIdx(idx)
-  }
-
-  function onFolderDrop(e: React.DragEvent, dropIdx: number) {
-    e.preventDefault()
-    if (!openFolder || folderDragIdx === null || folderDragIdx === dropIdx) {
-      resetFolderDrag(); return
+  function onDragEnd(e: React.DragEvent, idx: number) {
+    if (edgeHover) { setEdgeHover(null); resetDrag(); return }
+    const x = e.clientX; const y = e.clientY
+    const w = window.innerWidth; const h = window.innerHeight
+    if ((x <= 0 || x >= w || y <= 0 || y >= h) && dragIdx !== null) {
+      const item = layout[idx]
+      if (item?.type === 'module') window.ipcRenderer.invoke('detach-module', item.id)
     }
-    const children = [...openFolder.children]
-    const [item] = children.splice(folderDragIdx, 1)
-    const at = Math.max(0, Math.min(dropIdx > folderDragIdx ? dropIdx - 1 : dropIdx, children.length))
-    children.splice(at, 0, item)
-    const next = layout.map(i => i.id === openFolder.id ? { ...i, children } : i) as GridItem[]
-    saveLayout(next)
-    resetFolderDrag()
+    resetDrag(); setEdgeHover(null)
   }
 
+  // Folder drag
+  function onFolderDragStart(e: React.DragEvent, idx: number) { setFolderDragIdx(idx); e.dataTransfer.effectAllowed = 'move' }
+  function onFolderDragOver(e: React.DragEvent, idx: number) { e.preventDefault(); setFolderHoverIdx(idx) }
   function resetFolderDrag() { setFolderDragIdx(null); setFolderHoverIdx(null) }
 
-  // ── Folder actions ──────────────────────────────────────────
-  function ejectFromFolder(moduleId: string) {
-    if (!openFolder) return
-    const children = openFolder.children.filter(id => id !== moduleId)
-    const next = layout.map(i =>
-      i.id === openFolder.id ? { ...i, children } : i
-    ) as GridItem[]
-    next.push({ type: 'module', id: moduleId })
-    saveLayout(next)
-  }
-
-  function deleteFolder(folderId: string) {
-    const folder = layout.find(i => i.id === folderId) as FolderItem
-    const next = layout.filter(i => i.id !== folderId) as GridItem[]
-    folder.children.forEach(id => next.push({ type: 'module', id }))
-    saveLayout(next)
-    transitionTo(() => setOpenFolder(null))
-  }
-
-  function createFolder() {
-    const name = folderName.trim().toUpperCase() || 'FOLDER'
-    const item: FolderItem = { type: 'folder', id: `folder-${Date.now()}`, name, children: [] }
-    saveLayout([...layout, item])
-    setFolderName('')
-    setCreatingFolder(false)
-  }
-
-  // ── Render ──────────────────────────────────────────────────
   const ActiveComponent = active?.component ?? null
-
   const dragItemType = dragIdx !== null ? layout[dragIdx]?.type : null
 
+  const edgeZone = (edge: 'left' | 'right' | 'top' | 'bottom') => (
+    <div
+      className={`edge-drop edge-drop--${edge}${edgeHover === edge ? ' edge-drop--active' : ''}`}
+      onDragOver={e => { e.preventDefault(); setEdgeHover(edge) }}
+      onDragLeave={() => { if (edgeHover === edge) setEdgeHover(null) }}
+      onDrop={e => { e.preventDefault(); onEdgeDrop(edge) }}
+    />
+  )
+
   return (
-    <div className="council">
-      <div className="tron-corner tron-corner--tl" />
-      <div className="tron-corner tron-corner--tr" />
-      <div className="tron-corner tron-corner--bl" />
-      <div className="tron-corner tron-corner--br" />
-      <div className="version-tag">v5.0</div>
+    <div className={`pane${isInSplit ? ' pane--split' : ''}`}>
+      {dragIdx !== null && <>
+        {edgeZone('left')}
+        {edgeZone('right')}
+        {edgeZone('top')}
+        {edgeZone('bottom')}
+      </>}
+      {!isInSplit && <>
+        <div className="tron-corner tron-corner--tl" />
+        <div className="tron-corner tron-corner--tr" />
+        <div className="tron-corner tron-corner--bl" />
+        <div className="tron-corner tron-corner--br" />
+        <div className="version-tag">v5.0</div>
+      </>}
       <div className={`view-transition${viewPhase === 'exit' ? ' view-exit' : viewPhase === 'enter' ? ' view-enter' : ''}`}>
-      <div className="header">
+      <div className={`header${isInSplit ? ' header--compact' : ''}`}>
         {active ? (
           <div className="header-nav">
             <button className="back-btn" onClick={closeToGrid}>← THE GRID</button>
             <div className="page-title">{getLabel(active.id, active.name, active.description).name.toUpperCase()}</div>
+            <div className="header-actions">
+              <button className="header-action-btn" title="Open in new window" onClick={() => window.ipcRenderer.invoke('detach-module', active.id)}>⧉</button>
+              {onClose && <button className="header-action-btn header-action-btn--close" title="Close split" onClick={onClose}>✕</button>}
+            </div>
           </div>
         ) : openFolder ? (
           <div className="header-nav">
             <button className="back-btn" onClick={closeFolderView}>← THE GRID</button>
             <div className="page-title">{openFolder.name}</div>
+            {onClose && <div className="header-actions"><button className="header-action-btn header-action-btn--close" title="Close split" onClick={onClose}>✕</button></div>}
           </div>
         ) : (
-          <div className="title">THE GRID</div>
+          <div className="header-nav">
+            <div className="title">THE GRID</div>
+            {onClose && <div className="header-actions"><button className="header-action-btn header-action-btn--close" title="Close split" onClick={onClose}>✕</button></div>}
+          </div>
         )}
       </div>
       <div className="divider" />
       {ActiveComponent ? (
         <ActiveComponent />
       ) : openFolder ? (
-        // ── Inside a folder ──
         <div className="content">
           <div className="app-list">
             {openFolder.children.length === 0 && (
@@ -277,38 +212,14 @@ function App({ onReady }: { onReady?: () => void }) {
             {openFolder.children.map((modId, idx) => {
               const mod = modules.find(m => m.id === modId)
               if (!mod) return null
-              const isDragging = folderDragIdx === idx
-              const isHover = folderHoverIdx === idx && folderDragIdx !== idx
               const lbl = getLabel(modId, mod.name, mod.description)
-
-              if (editingId === modId) {
-                return (
-                  <div key={modId} className="app-row app-row--editing">
-                    <div className="grid-drag-handle" style={{ opacity: 0.3 }}>⠿</div>
-                    <div className="app-edit-fields">
-                      <input className="app-edit-name" value={editName} autoFocus
-                        onChange={e => setEditName(e.target.value)}
-                        onKeyDown={e => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') cancelEdit() }} />
-                      <input className="app-edit-desc" value={editDesc} placeholder="caption..."
-                        onChange={e => setEditDesc(e.target.value)}
-                        onKeyDown={e => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') cancelEdit() }} />
-                    </div>
-                    <div className="app-edit-actions">
-                      <button className="save-btn" onClick={saveEdit}>SAVE</button>
-                      <button className="save-btn" style={{ borderColor: '#1a1a1a', color: '#444' }} onClick={cancelEdit}>✕</button>
-                    </div>
-                  </div>
-                )
-              }
-
               return (
                 <div
                   key={modId}
-                  className={`app-row${isDragging ? ' grid-item--dragging' : ''}${isHover ? ' grid-item--hover' : ''}`}
+                  className={`app-row${folderDragIdx === idx ? ' grid-item--dragging' : ''}${folderHoverIdx === idx && folderDragIdx !== idx ? ' grid-item--hover' : ''}`}
                   draggable
                   onDragStart={e => onFolderDragStart(e, idx)}
                   onDragOver={e => onFolderDragOver(e, idx)}
-                  onDrop={e => onFolderDrop(e, idx)}
                   onDragEnd={resetFolderDrag}
                   onClick={() => openModule(mod)}
                 >
@@ -317,27 +228,12 @@ function App({ onReady }: { onReady?: () => void }) {
                     <div className="app-name">{lbl.name}</div>
                     <div className="app-desc">{lbl.desc}</div>
                   </div>
-                  <button className="grid-edit-btn" onClick={e => startEdit(e, modId, lbl.name, lbl.desc)}>✎</button>
-                  <button
-                    className="folder-eject-btn"
-                    onClick={e => { e.stopPropagation(); ejectFromFolder(modId) }}
-                  >↑</button>
                 </div>
               )
             })}
           </div>
-          <div className="grid-controls">
-            <button
-              className="grid-add-btn"
-              style={{ color: '#663333' }}
-              onClick={() => deleteFolder(openFolder.id)}
-            >
-              DELETE FOLDER
-            </button>
-          </div>
         </div>
       ) : (
-        // ── Main grid ──
         <div className="content">
           <div className="app-list">
             {layout.map((item, idx) => {
@@ -347,25 +243,6 @@ function App({ onReady }: { onReady?: () => void }) {
 
               if (item.type === 'folder') {
                 const folderLbl = getLabel(item.id, item.name, '')
-
-                if (editingId === item.id) {
-                  return (
-                    <div key={item.id} className="folder-tile app-row--editing">
-                      <div className="grid-drag-handle" style={{ opacity: 0.3 }}>⠿</div>
-                      <div className="folder-icon">▤</div>
-                      <div className="app-edit-fields">
-                        <input className="app-edit-name" value={editName} autoFocus
-                          onChange={e => setEditName(e.target.value)}
-                          onKeyDown={e => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') cancelEdit() }} />
-                      </div>
-                      <div className="app-edit-actions">
-                        <button className="save-btn" onClick={saveEdit}>SAVE</button>
-                        <button className="save-btn" style={{ borderColor: '#1a1a1a', color: '#444' }} onClick={cancelEdit}>✕</button>
-                      </div>
-                    </div>
-                  )
-                }
-
                 return (
                   <div
                     key={item.id}
@@ -383,7 +260,6 @@ function App({ onReady }: { onReady?: () => void }) {
                       <div className="app-name">{folderLbl.name}</div>
                       <div className="app-desc">{item.children.length} item{item.children.length !== 1 ? 's' : ''}</div>
                     </div>
-                    <button className="grid-edit-btn" onClick={e => startEdit(e, item.id, folderLbl.name, '')}>✎</button>
                     <div className="app-arrow">›</div>
                   </div>
                 )
@@ -391,27 +267,8 @@ function App({ onReady }: { onReady?: () => void }) {
 
               const mod = modules.find(m => m.id === item.id)
               if (!mod) return null
+              if (archived.includes(item.id)) return null
               const lbl = getLabel(item.id, mod.name, mod.description)
-
-              if (editingId === item.id) {
-                return (
-                  <div key={item.id} className="app-row app-row--editing">
-                    <div className="grid-drag-handle" style={{ opacity: 0.3 }}>⠿</div>
-                    <div className="app-edit-fields">
-                      <input className="app-edit-name" value={editName} autoFocus
-                        onChange={e => setEditName(e.target.value)}
-                        onKeyDown={e => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') cancelEdit() }} />
-                      <input className="app-edit-desc" value={editDesc} placeholder="caption..."
-                        onChange={e => setEditDesc(e.target.value)}
-                        onKeyDown={e => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') cancelEdit() }} />
-                    </div>
-                    <div className="app-edit-actions">
-                      <button className="save-btn" onClick={saveEdit}>SAVE</button>
-                      <button className="save-btn" style={{ borderColor: '#1a1a1a', color: '#444' }} onClick={cancelEdit}>✕</button>
-                    </div>
-                  </div>
-                )
-              }
 
               return (
                 <div
@@ -421,7 +278,7 @@ function App({ onReady }: { onReady?: () => void }) {
                   onDragStart={e => onDragStart(e, idx)}
                   onDragOver={e => onDragOver(e, idx)}
                   onDrop={e => onDrop(e, idx)}
-                  onDragEnd={resetDrag}
+                  onDragEnd={e => onDragEnd(e, idx)}
                   onClick={() => { if (!didDrag.current) openModule(mod) }}
                 >
                   <div className="grid-drag-handle">⠿</div>
@@ -429,40 +286,213 @@ function App({ onReady }: { onReady?: () => void }) {
                     <div className="app-name">{lbl.name}</div>
                     <div className="app-desc">{lbl.desc}</div>
                   </div>
-                  <button className="grid-edit-btn" onClick={e => startEdit(e, item.id, lbl.name, lbl.desc)}>✎</button>
+                  <button className="grid-archive-btn" title="Archive" onClick={e => { e.stopPropagation(); archiveModule(item.id) }}>⌂</button>
                   <div className="app-arrow">›</div>
                 </div>
               )
             })}
           </div>
           <div className="grid-controls">
-            {creatingFolder ? (
-              <div className="grid-add-section">
-                <input
-                  className="note-input grid-section-input"
-                  autoFocus
-                  placeholder="FOLDER NAME"
-                  value={folderName}
-                  onChange={e => setFolderName(e.target.value)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') createFolder()
-                    if (e.key === 'Escape') setCreatingFolder(false)
-                  }}
-                />
-                <button className="save-btn" onClick={createFolder}>CREATE</button>
-                <button
-                  className="save-btn"
-                  style={{ borderColor: '#1a1a1a', color: '#444' }}
-                  onClick={() => setCreatingFolder(false)}
-                >CANCEL</button>
-              </div>
-            ) : (
-              <button className="grid-add-btn" onClick={() => setCreatingFolder(true)}>+ FOLDER</button>
-            )}
+            <div className="grid-controls-row">
+              {archived.length > 0 && (
+                <button className="grid-add-btn grid-archive-toggle" onClick={() => setShowArchive(!showArchive)}>
+                  ARCHIVE <span className="tab-count">{archived.length}</span> {showArchive ? '▲' : '▼'}
+                </button>
+              )}
+            </div>
           </div>
+          {showArchive && archived.length > 0 && (
+            <div className="archive-section">
+              <div className="archive-header">ARCHIVED</div>
+              <div className="app-list">
+                {archived.map(modId => {
+                  const mod = modules.find(m => m.id === modId)
+                  if (!mod) return null
+                  const lbl = getLabel(modId, mod.name, mod.description)
+                  return (
+                    <div key={modId} className="app-row app-row--archived">
+                      <div className="app-info">
+                        <div className="app-name">{lbl.name}</div>
+                        <div className="app-desc">{lbl.desc}</div>
+                      </div>
+                      <button className="grid-restore-btn" onClick={() => unarchiveModule(modId)}>RESTORE</button>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
         </div>
       )}
       </div>
+    </div>
+  )
+}
+
+// ── Split layout renderer ───────────────────────────────────
+function SplitLayout({ state, onChange, layout, archived, showArchive, getLabel, archiveModule, unarchiveModule, setShowArchive }: {
+  state: LayoutState
+  onChange: (s: LayoutState) => void
+  layout: GridItem[]
+  archived: string[]
+  showArchive: boolean
+  getLabel: (id: string, defaultName: string, defaultDesc: string) => { name: string; desc: string }
+  archiveModule: (id: string) => void
+  unarchiveModule: (id: string) => void
+  setShowArchive: (v: boolean) => void
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  const handleResize = useCallback((delta: number) => {
+    if (!isSplit(state) || !containerRef.current) return
+    const rect = containerRef.current.getBoundingClientRect()
+    const total = state.dir === 'h' ? rect.width : rect.height
+    const frac = delta / total
+    const s0 = Math.max(0.15, Math.min(0.85, state.sizes[0] + frac))
+    onChange({ ...state, sizes: [s0, 1 - s0] })
+  }, [state, onChange])
+
+  if (!isSplit(state)) {
+    return (
+      <AppPane
+        initialModuleId={state.openModuleId}
+        layout={layout}
+        
+        archived={archived}
+        showArchive={showArchive}
+        onSplit={(dir, moduleId) => {
+          onChange({
+            dir,
+            sizes: [0.5, 0.5],
+            children: [
+              { type: 'single', openModuleId: null },
+              { type: 'single', openModuleId: moduleId },
+            ]
+          })
+        }}
+        onClose={null}
+        isInSplit={false}
+        getLabel={getLabel}
+        archiveModule={archiveModule}
+        unarchiveModule={unarchiveModule}
+        setShowArchive={setShowArchive}
+      />
+    )
+  }
+
+  return (
+    <div ref={containerRef} className={`split-container split-container--${state.dir}`}>
+      <div className="split-pane" style={{ flex: `0 0 ${state.sizes[0] * 100}%` }}>
+        {isSplit(state.children[0]) ? (
+          <SplitLayout
+            state={state.children[0]}
+            onChange={s => onChange({ ...state, children: [s as PaneState | SplitState, state.children[1]] })}
+            layout={layout} archived={archived} showArchive={showArchive}
+            getLabel={getLabel} archiveModule={archiveModule} unarchiveModule={unarchiveModule} setShowArchive={setShowArchive}
+          />
+        ) : (
+          <AppPane
+            initialModuleId={state.children[0].openModuleId}
+            layout={layout} archived={archived} showArchive={showArchive}
+            onSplit={(dir, moduleId) => {
+              const newChild: SplitState = {
+                dir, sizes: [0.5, 0.5],
+                children: [state.children[0], { type: 'single', openModuleId: moduleId }]
+              }
+              onChange({ ...state, children: [newChild as any, state.children[1]] })
+            }}
+            onClose={() => onChange(state.children[1])}
+            isInSplit={true}
+            getLabel={getLabel} archiveModule={archiveModule} unarchiveModule={unarchiveModule} setShowArchive={setShowArchive}
+          />
+        )}
+      </div>
+      <ResizeHandle dir={state.dir} onResize={handleResize} />
+      <div className="split-pane" style={{ flex: `0 0 ${state.sizes[1] * 100}%` }}>
+        {isSplit(state.children[1]) ? (
+          <SplitLayout
+            state={state.children[1]}
+            onChange={s => onChange({ ...state, children: [state.children[0], s as PaneState | SplitState] })}
+            layout={layout} archived={archived} showArchive={showArchive}
+            getLabel={getLabel} archiveModule={archiveModule} unarchiveModule={unarchiveModule} setShowArchive={setShowArchive}
+          />
+        ) : (
+          <AppPane
+            initialModuleId={state.children[1].openModuleId}
+            layout={layout} archived={archived} showArchive={showArchive}
+            onSplit={(dir, moduleId) => {
+              const newChild: SplitState = {
+                dir, sizes: [0.5, 0.5],
+                children: [state.children[1], { type: 'single', openModuleId: moduleId }]
+              }
+              onChange({ ...state, children: [state.children[0], newChild as any] })
+            }}
+            onClose={() => onChange(state.children[0])}
+            isInSplit={true}
+            getLabel={getLabel} archiveModule={archiveModule} unarchiveModule={unarchiveModule} setShowArchive={setShowArchive}
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Root App ────────────────────────────────────────────────
+function App({ onReady }: { onReady?: () => void }) {
+  const hashModule = window.location.hash.match(/^#\/module\/(.+)$/)
+  if (hashModule) {
+    useEffect(() => { onReady?.() }, [])
+    return <DetachedModuleView moduleId={hashModule[1]} />
+  }
+
+  const [layoutState, setLayoutState] = useState<LayoutState>({ type: 'single', openModuleId: null })
+  const [layout, setLayout] = useState<GridItem[]>(defaultLayout)
+  const [labels, setLabels] = useState<Record<string, { name: string; desc: string }>>({})
+  const [archived, setArchived] = useState<string[]>([])
+  const [showArchive, setShowArchive] = useState(false)
+
+  useEffect(() => {
+    Promise.all([
+      window.ipcRenderer.invoke('load-module-labels').then((saved: any) => { if (saved) setLabels(saved) }),
+      window.ipcRenderer.invoke('load-layout').then((saved: GridItem[] | null) => {
+        if (saved && Array.isArray(saved)) {
+          const allIds = new Set<string>()
+          saved.forEach(item => { allIds.add(item.id); if (item.type === 'folder') item.children.forEach(id => allIds.add(id)) })
+          const newMods = modules.filter(m => !allIds.has(m.id)).map(m => ({ type: 'module' as const, id: m.id }))
+          setLayout([...saved, ...newMods])
+        }
+      }),
+      window.ipcRenderer.invoke('load-archived').then((saved: string[] | null) => { if (saved) setArchived(saved) }),
+    ]).then(() => onReady?.())
+  }, [])
+
+  function getLabel(id: string, defaultName: string, defaultDesc: string) {
+    return { name: labels[id]?.name ?? defaultName, desc: labels[id]?.desc ?? defaultDesc }
+  }
+
+  function archiveModule(moduleId: string) {
+    const next = [...archived, moduleId]; setArchived(next)
+    window.ipcRenderer.invoke('save-archived', next)
+  }
+  function unarchiveModule(moduleId: string) {
+    const next = archived.filter(id => id !== moduleId); setArchived(next)
+    window.ipcRenderer.invoke('save-archived', next)
+  }
+
+  return (
+    <div className="council">
+      <SplitLayout
+        state={layoutState}
+        onChange={setLayoutState}
+        layout={layout}
+        
+        archived={archived}
+        showArchive={showArchive}
+        getLabel={getLabel}
+        archiveModule={archiveModule}
+        unarchiveModule={unarchiveModule}
+        setShowArchive={setShowArchive}
+      />
     </div>
   )
 }

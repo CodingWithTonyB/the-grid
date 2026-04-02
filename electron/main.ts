@@ -434,7 +434,7 @@ ipcMain.handle('save-history', (_event, history: unknown) => {
 })
 
 // --- WiFi Recon scan ---
-const wifiScanBinary = path.join(process.env.APP_ROOT!, 'scripts', 'wifi-scan')
+// wifi-scan.swift kept for standalone use; scan now uses system_profiler + compiled binary
 
 interface WifiNetwork {
   ssid: string; bssid: string; rssi: number; channel: number
@@ -444,27 +444,495 @@ interface WifiNetwork {
 
 ipcMain.handle('wifi-recon-scan', async () => {
   try {
-    const { stdout } = await execAsync(`"${wifiScanBinary}"`, { timeout: 20000 })
-    const networks: WifiNetwork[] = JSON.parse(stdout.trim())
-    // Deduplicate by SSID+channel (same AP on same channel), keep strongest signal
+    // Run both sources in parallel: compiled binary (signal data) + system_profiler (SSIDs)
+    const [binaryResult, profilerResult] = await Promise.all([
+      execAsync(`"${path.join(process.env.APP_ROOT!, 'scripts', 'wifi-scan')}"`, { timeout: 20000 }).catch(() => ({ stdout: '[]' })),
+      execAsync('/usr/sbin/system_profiler SPAirPortDataType', { timeout: 20000 }).catch(() => ({ stdout: '' })),
+    ])
+
+    // Parse binary output (CoreWLAN — has signal, may lack SSIDs)
+    let cwlanNets: WifiNetwork[] = []
+    try { cwlanNets = JSON.parse(binaryResult.stdout.trim()) } catch {}
+
+    // Parse system_profiler (always has SSIDs)
+    const profilerNets: WifiNetwork[] = []
+    const profOut = profilerResult.stdout
+    const otherIdx = profOut.indexOf('Other Local Wi-Fi Networks:')
+    if (otherIdx !== -1) {
+      let block = profOut.slice(otherIdx + 'Other Local Wi-Fi Networks:'.length)
+      const awdlIdx = block.indexOf('awdl0:')
+      if (awdlIdx !== -1) block = block.slice(0, awdlIdx)
+      const infoKeys = new Set(['PHY Mode', 'Channel', 'Network Type', 'Security', 'Signal / Noise', 'Country Code', 'Transmit Rate', 'MCS Index'])
+      let cur: any = null
+      for (const line of block.split('\n')) {
+        const t = line.trim()
+        if (!t || !t.includes(':')) continue
+        const ci = t.indexOf(':')
+        const k = t.slice(0, ci).trim(), v = t.slice(ci + 1).trim()
+        if (!infoKeys.has(k)) {
+          if (cur) profilerNets.push(cur)
+          cur = { ssid: k, bssid: '', rssi: 0, channel: 0, band: 0, channelWidth: 1, noise: 0, ibss: false, countryCode: '', beaconInterval: 100, security: 'Unknown', securityLevel: 0 }
+        } else if (cur) {
+          if (k === 'Security') {
+            cur.security = v
+            if (v.includes('None')) cur.securityLevel = 1
+            else if (v.includes('WEP')) cur.securityLevel = 2
+            else if (v.includes('WPA3')) cur.securityLevel = 5
+            else if (v.includes('WPA2')) cur.securityLevel = 4
+            else if (v.includes('WPA')) cur.securityLevel = 3
+          } else if (k === 'Channel') {
+            const m = v.match(/^(\d+)/); if (m) cur.channel = parseInt(m[1])
+            if (v.includes('2GHz')) cur.band = 1; else if (v.includes('5GHz')) cur.band = 2; else if (v.includes('6GHz')) cur.band = 3
+            if (v.includes('160MHz')) cur.channelWidth = 4; else if (v.includes('80MHz')) cur.channelWidth = 3; else if (v.includes('40MHz')) cur.channelWidth = 2
+          } else if (k === 'Signal / Noise') {
+            const nums = v.match(/-?\d+/g)
+            if (nums?.[0]) cur.rssi = parseInt(nums[0]); if (nums?.[1]) cur.noise = parseInt(nums[1])
+          }
+        }
+      }
+      if (cur) profilerNets.push(cur)
+    }
+
+    // Merge: start with CoreWLAN data, fill in SSIDs from profiler
+    const profilerByChBand = new Map<string, WifiNetwork>()
+    for (const p of profilerNets) {
+      profilerByChBand.set(`${p.channel}-${p.band}`, p)
+    }
+
+    const merged: WifiNetwork[] = []
+    const usedKeys = new Set<string>()
+
+    for (const net of cwlanNets) {
+      const key = `${net.channel}-${net.band}`
+      if (!net.ssid && profilerByChBand.has(key)) {
+        const p = profilerByChBand.get(key)!
+        net.ssid = p.ssid
+        if (!net.security || net.security === 'Unknown') { net.security = p.security; net.securityLevel = p.securityLevel }
+      }
+      merged.push(net)
+      usedKeys.add(`${net.ssid}-${net.channel}-${net.band}`)
+    }
+
+    // Add profiler-only networks
+    for (const p of profilerNets) {
+      const key = `${p.ssid}-${p.channel}-${p.band}`
+      if (!usedKeys.has(key)) { merged.push(p); usedKeys.add(key) }
+    }
+
+    // Deduplicate
     const deduped = new Map<string, WifiNetwork>()
-    for (const net of networks) {
+    for (const net of merged) {
       const key = `${net.ssid || '(hidden)'}-${net.channel}-${net.band}`
       const existing = deduped.get(key)
       if (!existing || net.rssi > existing.rssi) deduped.set(key, net)
     }
-    // Look up vendor from BSSID MAC prefix
+
     const result = [...deduped.values()].map(net => ({
       ...net,
       ssid: net.ssid || '(hidden)',
       vendor: net.bssid ? lookupVendor(net.bssid) : '',
-      signalQuality: Math.min(100, Math.max(0, 2 * (net.rssi + 100))), // Convert RSSI to 0-100%
+      signalQuality: net.rssi !== 0 ? Math.min(100, Math.max(0, 2 * (net.rssi + 100))) : 50,
       bandLabel: net.band === 1 ? '2.4 GHz' : net.band === 2 ? '5 GHz' : net.band === 3 ? '6 GHz' : '?',
     }))
     return result.sort((a, b) => b.rssi - a.rssi)
-  } catch {
+  } catch (err: any) {
+    console.error('[wifi-recon] scan failed:', err?.message || err)
     return []
   }
+})
+
+// --- Vulnerability scan ---
+interface VulnFinding {
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info'
+  title: string
+  detail: string
+  port?: number
+  verified?: boolean
+  evidence?: string[]  // proof lines from verification
+}
+
+async function checkHttpNoAuth(ip: string, port: number, secure: boolean): Promise<VulnFinding | null> {
+  const proto = secure ? 'https' : 'http'
+  return new Promise(resolve => {
+    const mod = secure ? https : http
+    const req = mod.get(`${proto}://${ip}:${port}/`, { timeout: 3000, rejectUnauthorized: false }, res => {
+      let body = ''
+      res.on('data', c => body += c.toString().slice(0, 2000))
+      res.on('end', () => {
+        const lower = body.toLowerCase()
+        // Check for login pages (means it at least requires auth)
+        const hasLogin = lower.includes('login') || lower.includes('password') || lower.includes('sign in') || lower.includes('authenticate')
+        // Check for admin/config pages with no auth
+        const hasAdmin = lower.includes('settings') || lower.includes('configuration') || lower.includes('dashboard') || lower.includes('admin')
+        const title = (body.match(/<title>([^<]+)<\/title>/i) || [])[1] || ''
+
+        if (!hasLogin && hasAdmin) {
+          resolve({ severity: 'critical', title: 'Unauthenticated admin panel', detail: `${proto}://${ip}:${port} — "${title}" accessible without login`, port })
+        } else if (!hasLogin && res.statusCode === 200 && body.length > 100) {
+          resolve({ severity: 'medium', title: 'Web service without authentication', detail: `${proto}://${ip}:${port} — "${title}" returns content without auth`, port })
+        } else {
+          resolve(null)
+        }
+      })
+    })
+    req.on('error', () => resolve(null))
+    req.on('timeout', () => { req.destroy(); resolve(null) })
+  })
+}
+
+// Analyze already-discovered open ports for vulnerabilities (used inside deep-probe)
+function analyzeVulns(openPorts: { port: number; name: string; banner: string }[], _ip: string): VulnFinding[] {
+  const findings: VulnFinding[] = []
+  const openSet = new Set(openPorts.map(p => p.port))
+
+  const dangerousPorts: { port: number; name: string; severity: VulnFinding['severity']; detail: string }[] = [
+    { port: 23, name: 'Telnet', severity: 'critical', detail: 'Telnet transmits everything in plaintext — passwords visible to anyone on the network' },
+    { port: 21, name: 'FTP', severity: 'high', detail: 'FTP sends credentials in plaintext' },
+    { port: 445, name: 'SMB', severity: 'high', detail: 'SMB file sharing exposed — common ransomware target' },
+    { port: 139, name: 'NetBIOS', severity: 'medium', detail: 'NetBIOS exposed — can leak system info and share names' },
+    { port: 3389, name: 'RDP', severity: 'high', detail: 'Remote Desktop exposed — brute-force target' },
+    { port: 5900, name: 'VNC', severity: 'high', detail: 'VNC remote desktop exposed — often poorly secured' },
+    { port: 1883, name: 'MQTT', severity: 'medium', detail: 'MQTT IoT broker exposed — often has no auth' },
+    { port: 5353, name: 'mDNS', severity: 'low', detail: 'mDNS exposed — leaks device info to local network' },
+    { port: 161, name: 'SNMP', severity: 'medium', detail: 'SNMP exposed — often uses default "public" community string' },
+    { port: 1900, name: 'UPnP', severity: 'medium', detail: 'UPnP enabled — can be used to open ports from inside the network' },
+  ]
+  for (const dp of dangerousPorts) {
+    if (openSet.has(dp.port)) {
+      findings.push({ severity: dp.severity, title: `${dp.name} open (port ${dp.port})`, detail: dp.detail, port: dp.port })
+    }
+  }
+
+  // SSH banner check
+  const ssh = openPorts.find(p => p.port === 22)
+  if (ssh && ssh.banner?.includes('SSH')) {
+    findings.push({ severity: 'info', title: 'SSH service running', detail: `${ssh.banner.trim()} — ensure key-based auth only`, port: 22 })
+  }
+
+  const sevOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
+  findings.sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity])
+  return findings
+}
+
+// Verify a vulnerability — actually test if it's exploitable and gather evidence
+ipcMain.handle('verify-vuln', async (_event, ip: string, port: number, service: string) => {
+  const evidence: string[] = []
+  let verified = false
+
+  const readSocket = (host: string, p: number, send?: string, timeout = 4000): Promise<string> =>
+    new Promise(resolve => {
+      const sock = new net.Socket()
+      let data = ''
+      sock.setTimeout(timeout)
+      sock.connect(p, host, () => { if (send) sock.write(send) })
+      sock.on('data', c => { data += c.toString(); if (data.length > 2000) sock.destroy() })
+      sock.on('end', () => resolve(data))
+      sock.on('timeout', () => { sock.destroy(); resolve(data) })
+      sock.on('error', () => resolve(data))
+    })
+
+  try {
+    if (service === 'Telnet' || port === 23) {
+      // Connect and grab banner/login prompt
+      const resp = await readSocket(ip, 23)
+      if (resp.length > 0) {
+        verified = true
+        evidence.push('Connected to Telnet service')
+        const lines = resp.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+        for (const line of lines.slice(0, 5)) evidence.push(line)
+        if (resp.toLowerCase().includes('login')) evidence.push('Login prompt received — password will be sent in plaintext')
+        else evidence.push('Service responded — all traffic is unencrypted')
+      }
+    } else if (service === 'FTP' || port === 21) {
+      // Try anonymous login
+      const banner = await readSocket(ip, 21)
+      if (banner.length > 0) {
+        evidence.push(`Banner: ${banner.split('\n')[0].trim()}`)
+        // Try anonymous
+        const sock = new net.Socket()
+        await new Promise<string>(resolve => {
+          let buf = ''
+          sock.setTimeout(4000)
+          sock.connect(21, ip, () => {})
+          sock.on('data', c => {
+            buf += c.toString()
+            if (buf.includes('220') && !buf.includes('USER')) { sock.write('USER anonymous\r\n') }
+            else if (buf.includes('331')) { sock.write('PASS test@test.com\r\n') }
+            else if (buf.includes('230')) { verified = true; sock.write('QUIT\r\n'); resolve(buf) }
+            else if (buf.includes('530') || buf.includes('500')) { resolve(buf) }
+          })
+          sock.on('timeout', () => { sock.destroy(); resolve(buf) })
+          sock.on('error', () => resolve(buf))
+        })
+        if (verified) {
+          evidence.push('ANONYMOUS LOGIN SUCCESSFUL — no credentials needed')
+        } else {
+          evidence.push('Anonymous login rejected — but credentials still sent in plaintext')
+          verified = true
+        }
+      }
+    } else if (service === 'SMB' || port === 445) {
+      // Try multiple SMB access methods
+      const trySmb = async (args: string[], label: string): Promise<string> => {
+        return new Promise(resolve => {
+          const proc = spawn('smbclient', args, { timeout: 8000 })
+          let out = ''
+          proc.stdout.on('data', c => out += c.toString())
+          proc.stderr.on('data', c => out += c.toString())
+          proc.on('close', () => resolve(out))
+          proc.on('error', () => resolve(`${label}: smbclient not available`))
+        })
+      }
+      // 1. Null session (no user, no pass)
+      const nullResult = await trySmb(['-L', ip, '-N', '--timeout=5'], 'null session')
+      if (nullResult.includes('Sharename') || nullResult.includes('Disk')) {
+        verified = true
+        evidence.push('NULL SESSION — SHARES ENUMERABLE WITHOUT ANY CREDENTIALS:')
+        const lines = nullResult.split('\n').filter(l => l.includes('Disk') || l.includes('IPC') || l.includes('Printer'))
+        for (const l of lines.slice(0, 8)) evidence.push(`  ${l.trim()}`)
+      } else {
+        // 2. Guest account
+        const guestResult = await trySmb(['-L', ip, '-U', 'guest%', '--timeout=5'], 'guest')
+        if (guestResult.includes('Sharename') || guestResult.includes('Disk')) {
+          verified = true
+          evidence.push('GUEST ACCOUNT — SHARES ACCESSIBLE WITHOUT PASSWORD:')
+          const lines = guestResult.split('\n').filter(l => l.includes('Disk') || l.includes('IPC') || l.includes('Printer'))
+          for (const l of lines.slice(0, 8)) evidence.push(`  ${l.trim()}`)
+        } else {
+          // 3. Check SMB signing and protocol version via nmap if available
+          const nmapResult = await new Promise<string>(resolve => {
+            const proc = spawn('nmap', ['--script', 'smb-security-mode,smb2-security-mode', '-p445', ip], { timeout: 10000 })
+            let out = ''
+            proc.stdout.on('data', c => out += c.toString())
+            proc.stderr.on('data', c => out += c.toString())
+            proc.on('close', () => resolve(out))
+            proc.on('error', () => resolve('nmap not available'))
+          })
+          if (nmapResult.includes('signing') || nmapResult.includes('SMB')) {
+            verified = true
+            const lines = nmapResult.split('\n').filter(l => l.includes('signing') || l.includes('message') || l.includes('SMBv') || l.includes('account'))
+            if (lines.length > 0) {
+              evidence.push('SMB SECURITY CONFIG:')
+              for (const l of lines.slice(0, 6)) evidence.push(`  ${l.trim()}`)
+              if (nmapResult.includes('not required')) evidence.push('MESSAGE SIGNING NOT REQUIRED — vulnerable to relay attacks')
+              if (nmapResult.includes('guest')) evidence.push('GUEST ACCESS ENABLED')
+            }
+          }
+          if (!verified) {
+            // Still flag it — SMB is listening
+            verified = true
+            evidence.push('SMB service is listening and accepting connections')
+            if (nullResult.includes('NT_STATUS_ACCESS_DENIED')) {
+              evidence.push('Share listing requires credentials — but service is still exposed')
+            }
+            if (nullResult.includes('NT_STATUS_LOGON_FAILURE')) {
+              evidence.push('Authentication required — brute-force is possible')
+            }
+            evidence.push('Exposed SMB is a primary ransomware and lateral movement vector')
+            // Show raw error for context
+            const firstLine = nullResult.split('\n').find(l => l.includes('NT_STATUS'))
+            if (firstLine) evidence.push(`Response: ${firstLine.trim()}`)
+          }
+        }
+      }
+      // Try to connect to common shares
+      for (const share of ['C$', 'ADMIN$', 'IPC$', 'Users', 'Public', 'shared']) {
+        const shareResult = await trySmb([`//${ip}/${share}`, '-N', '-c', 'dir', '--timeout=3'], share)
+        if (shareResult.includes('blocks') || shareResult.includes('\\')) {
+          evidence.push(`SHARE ACCESSIBLE: //${ip}/${share}`)
+          const files = shareResult.split('\n').filter(l => l.trim().length > 0 && !l.includes('blocks of size')).slice(0, 4)
+          for (const f of files) evidence.push(`  ${f.trim()}`)
+          verified = true
+        }
+      }
+    } else if (service === 'VNC' || port === 5900) {
+      // Full VNC handshake to determine auth requirement
+      const vncCheck = await new Promise<{ version: string; authTypes: number[]; noAuth: boolean }>(resolve => {
+        const sock = new net.Socket()
+        let buf = Buffer.alloc(0)
+        let phase = 0 // 0=version, 1=security
+        const result = { version: '', authTypes: [] as number[], noAuth: false }
+        sock.setTimeout(5000)
+        sock.connect(5900, ip, () => {})
+        sock.on('data', (data) => {
+          buf = Buffer.concat([buf, data])
+          if (phase === 0 && buf.length >= 12) {
+            result.version = buf.slice(0, 12).toString().trim()
+            // Reply with same version
+            sock.write(buf.slice(0, 12))
+            phase = 1
+            buf = Buffer.alloc(0)
+          } else if (phase === 1 && buf.length >= 1) {
+            // RFB 3.3: server picks auth (4 bytes: type as u32)
+            // RFB 3.7+: server sends list
+            if (result.version.includes('003.003') || result.version.includes('003.004') || result.version.includes('003.005')) {
+              if (buf.length >= 4) {
+                const authType = buf.readUInt32BE(0)
+                result.authTypes = [authType]
+                if (authType === 1) result.noAuth = true
+                sock.destroy()
+                resolve(result)
+              }
+            } else {
+              const numTypes = buf[0]
+              if (numTypes === 0) {
+                // Connection failed — read reason
+                sock.destroy(); resolve(result)
+              } else if (buf.length >= 1 + numTypes) {
+                for (let i = 0; i < numTypes; i++) result.authTypes.push(buf[1 + i])
+                if (result.authTypes.includes(1)) result.noAuth = true
+                sock.destroy()
+                resolve(result)
+              }
+            }
+          }
+        })
+        sock.on('timeout', () => { sock.destroy(); resolve(result) })
+        sock.on('error', () => resolve(result))
+      })
+
+      if (vncCheck.version) {
+        verified = true
+        evidence.push(`VNC version: ${vncCheck.version}`)
+        const authNames: Record<number, string> = { 1: 'None (NO PASSWORD)', 2: 'VNC Password', 16: 'Tight', 19: 'VeNCrypt', 30: 'Apple Remote Desktop' }
+        if (vncCheck.authTypes.length > 0) {
+          evidence.push(`Auth types offered: ${vncCheck.authTypes.map(t => authNames[t] || `type ${t}`).join(', ')}`)
+        }
+        if (vncCheck.noAuth) {
+          evidence.push('NO AUTHENTICATION REQUIRED — SCREEN VISIBLE TO ANYONE ON NETWORK')
+          evidence.push('An attacker can view and control this machine right now')
+        } else if (vncCheck.authTypes.includes(2)) {
+          evidence.push('VNC password auth — single shared password, no username')
+          evidence.push('Password is limited to 8 chars max and sent with weak DES encryption')
+          evidence.push('Brute-forceable and all traffic after auth is unencrypted')
+        } else if (vncCheck.authTypes.includes(30)) {
+          evidence.push('Apple Remote Desktop auth — stronger than basic VNC')
+          evidence.push('Still exposed to network — should be firewalled or tunneled through SSH')
+        }
+      } else {
+        evidence.push('VNC port open but handshake failed — may be filtered or non-standard')
+      }
+    } else if (service === 'RDP' || port === 3389) {
+      // Just verify connectivity and banner
+      const r = await tcpProbe(ip, 3389, 3000)
+      if (r.open) {
+        verified = true
+        evidence.push('RDP service accepting connections')
+        if (r.banner) evidence.push(`Banner: ${r.banner.slice(0, 80)}`)
+        evidence.push('Exposed to brute-force and pass-the-hash attacks')
+        evidence.push('NLA (Network Level Authentication) status unknown from outside')
+      }
+    } else if (service === 'MQTT' || port === 1883) {
+      // Try MQTT CONNECT without auth
+      const connectPacket = Buffer.from([
+        0x10, 0x10, 0x00, 0x04, 0x4d, 0x51, 0x54, 0x54,  // MQTT
+        0x04, 0x02, 0x00, 0x3c, 0x00, 0x04, 0x74, 0x65, 0x73, 0x74  // protocol, keepalive, client "test"
+      ])
+      const resp = await readSocket(ip, 1883, connectPacket.toString('binary'), 3000)
+      if (resp.length > 0) {
+        verified = true
+        const connack = resp.charCodeAt(0)
+        if (connack === 0x20) {
+          const rc = resp.length > 3 ? resp.charCodeAt(3) : -1
+          if (rc === 0) {
+            evidence.push('MQTT CONNECTED WITHOUT AUTHENTICATION')
+            evidence.push('Can subscribe to all topics and read IoT device data')
+            evidence.push('Can publish commands to IoT devices')
+          } else {
+            evidence.push('MQTT requires auth — connection refused')
+          }
+        } else {
+          evidence.push('MQTT port responded')
+        }
+      }
+    } else if (service === 'SNMP' || port === 161) {
+      // Try default "public" community string via snmpget
+      const result = await new Promise<string>(resolve => {
+        const proc = spawn('snmpget', ['-v2c', '-c', 'public', ip, '1.3.6.1.2.1.1.1.0'], { timeout: 5000 })
+        let out = ''
+        proc.stdout.on('data', c => out += c.toString())
+        proc.stderr.on('data', c => out += c.toString())
+        proc.on('close', () => resolve(out))
+        proc.on('error', () => resolve('snmpget not available'))
+      })
+      if (result.includes('STRING') || result.includes('SNMPv2')) {
+        verified = true
+        evidence.push('DEFAULT "public" COMMUNITY STRING WORKS')
+        evidence.push(`System: ${result.split('\n')[0].trim().slice(0, 120)}`)
+        evidence.push('Full device info, routing tables, ARP cache readable')
+      } else if (result.includes('Timeout')) {
+        evidence.push('SNMP did not respond to "public" community — may use different string')
+      } else if (result.includes('not available')) {
+        evidence.push('snmpget not installed — install net-snmp for full verification')
+        const r = await tcpProbe(ip, 161, 2000)
+        if (r.open) { verified = true; evidence.push('SNMP port is open and responding') }
+      }
+    } else if (port === 22) {
+      // SSH — check auth methods
+      const resp = await readSocket(ip, 22)
+      if (resp.includes('SSH')) {
+        evidence.push(`Version: ${resp.split('\n')[0].trim()}`)
+        // Try to get auth methods via ssh command
+        const result = await new Promise<string>(resolve => {
+          const proc = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=no', ip, 'exit'], { timeout: 5000 })
+          let out = ''
+          proc.stderr.on('data', c => out += c.toString())
+          proc.on('close', () => resolve(out))
+          proc.on('error', () => resolve(out))
+        })
+        if (result.includes('password') || result.includes('Password')) {
+          verified = true
+          evidence.push('PASSWORD AUTHENTICATION ENABLED')
+          evidence.push('Vulnerable to brute-force — should use key-only auth')
+        } else if (result.includes('publickey')) {
+          evidence.push('Key-based auth only — good configuration')
+        } else {
+          evidence.push('Auth methods could not be fully determined')
+          if (result.trim()) evidence.push(result.split('\n')[0].trim())
+        }
+      }
+    } else if (port === 80 || port === 443 || port === 8080 || port === 8443) {
+      // Web — try to access and show what's exposed
+      const secure = [443, 8443].includes(port)
+      const proto = secure ? 'https' : 'http'
+      const mod = secure ? https : http
+      const paths = ['/', '/admin', '/setup', '/config', '/api', '/status', '/login']
+      for (const p of paths) {
+        try {
+          const result = await new Promise<{ status: number; title: string; hasAuth: boolean; size: number } | null>(resolve => {
+            const req = mod.get(`${proto}://${ip}:${port}${p}`, { timeout: 3000, rejectUnauthorized: false }, res => {
+              let body = ''
+              res.on('data', c => body += c.toString().slice(0, 3000))
+              res.on('end', () => {
+                const title = (body.match(/<title>([^<]+)<\/title>/i) || [])[1] || ''
+                const hasAuth = /login|password|sign.in|authenticate/i.test(body)
+                resolve({ status: res.statusCode || 0, title, hasAuth, size: body.length })
+              })
+            })
+            req.on('error', () => resolve(null))
+            req.on('timeout', () => { req.destroy(); resolve(null) })
+          })
+          if (result && result.status === 200) {
+            if (!result.hasAuth) {
+              verified = true
+              evidence.push(`${proto}://${ip}:${port}${p} — ACCESSIBLE, NO LOGIN (${result.title || 'no title'})`)
+            } else {
+              evidence.push(`${proto}://${ip}:${port}${p} — login page (${result.title || 'auth required'})`)
+            }
+          } else if (result && result.status === 401) {
+            evidence.push(`${proto}://${ip}:${port}${p} — 401 auth required`)
+          }
+        } catch {}
+      }
+      if (evidence.length === 0) evidence.push('Web service did not respond to common paths')
+    }
+  } catch (err: any) {
+    evidence.push(`Verification error: ${err.message}`)
+  }
+
+  if (evidence.length === 0) evidence.push('Could not gather additional evidence')
+
+  return { verified, evidence, port, service }
 })
 
 // --- Probe persistence ---
@@ -945,6 +1413,7 @@ ipcMain.handle('deep-probe-device', async (_event, ip: string, mac?: string) => 
     ssdpInfo: string
     arpType: string
     reverseDns: string
+    vulns: VulnFinding[]
   } = {
     ip,
     mac: mac || '',
@@ -958,6 +1427,7 @@ ipcMain.handle('deep-probe-device', async (_event, ip: string, mac?: string) => 
     ssdpInfo: '',
     arpType: '',
     reverseDns: '',
+    vulns: [],
   }
 
   // TTL + OS
@@ -1002,6 +1472,49 @@ ipcMain.handle('deep-probe-device', async (_event, ip: string, mac?: string) => 
 
   // mDNS
   result.mdnsServices = await mdnsProbe(ip)
+
+  // Vulnerability analysis on discovered ports
+  result.vulns = analyzeVulns(result.ports, ip)
+
+  // Check web ports for unauthenticated admin panels
+  const vulnWebPorts = result.ports.filter(p =>
+    [80, 443, 8080, 8443, 8000, 8888, 3000, 5000, 9090, 32400].includes(p.port)
+  )
+  const vulnWebResults = await Promise.all(
+    vulnWebPorts.map(p => {
+      const secure = [443, 8443].includes(p.port)
+      return checkHttpNoAuth(ip, p.port, secure)
+    })
+  )
+  for (const r of vulnWebResults) { if (r) result.vulns.push(r) }
+
+  // Check default credential paths on port 80
+  if (result.ports.some(p => p.port === 80)) {
+    const defaultPaths = ['/admin', '/setup', '/config', '/api', '/status']
+    for (const dp of defaultPaths) {
+      try {
+        const finding = await new Promise<VulnFinding | null>(resolve => {
+          http.get(`http://${ip}${dp}`, { timeout: 2000 }, res => {
+            if (res.statusCode === 200) {
+              let body = ''
+              res.on('data', c => body += c.toString().slice(0, 1000))
+              res.on('end', () => {
+                const lower = body.toLowerCase()
+                if (!lower.includes('login') && !lower.includes('password') && body.length > 50) {
+                  resolve({ severity: 'medium', title: `${dp.slice(1)} page accessible`, detail: `http://${ip}${dp} — no authentication required`, port: 80 })
+                } else resolve(null)
+              })
+            } else resolve(null)
+          }).on('error', () => resolve(null)).on('timeout', () => resolve(null))
+        })
+        if (finding) result.vulns.push(finding)
+      } catch {}
+    }
+  }
+
+  // Re-sort vulns by severity
+  const sevOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
+  result.vulns.sort((a, b) => (sevOrder[a.severity] ?? 5) - (sevOrder[b.severity] ?? 5))
 
   // Auto-save probe result to disk
   cachedProbes[ip] = result

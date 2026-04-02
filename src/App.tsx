@@ -194,7 +194,7 @@ function AppPane({ initialModuleId, layout, archived, showArchive, onSplit, onCl
             {onClose && <div className="header-actions"><button className="header-action-btn header-action-btn--close" title="Close split" onClick={onClose}>✕</button></div>}
           </div>
         ) : (
-          <div className="header-nav">
+          <div className="header-nav header-nav--home">
             <div className="title">THE GRID</div>
             {onClose && <div className="header-actions"><button className="header-action-btn header-action-btn--close" title="Close split" onClick={onClose}>✕</button></div>}
           </div>

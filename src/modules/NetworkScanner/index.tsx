@@ -57,7 +57,21 @@ interface ProbeResult {
   reverseDns?: string
 }
 
-type Tab = 'online' | 'history'
+// Network Monitor types
+interface NetDevice {
+  mac: string; ip: string; name: string
+  firstSeen: number; lastSeen: number
+  online: boolean; watchOnline: boolean; watchOffline: boolean
+  scansTotal: number; scansOnline: number
+  latencyMs: number | null; latencyHistory: number[]
+}
+interface NetEvent {
+  id: string; ts: number; type: 'joined' | 'left' | 'new'
+  mac: string; name: string; ip: string
+}
+interface NetmonSnapshot { devices: NetDevice[]; events: NetEvent[] }
+
+type Tab = 'online' | 'history' | 'networks' | 'events'
 
 function timeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
@@ -67,6 +81,43 @@ function timeAgo(iso: string): string {
   const hrs = Math.floor(mins / 60)
   if (hrs < 24) return `${hrs}h ago`
   return `${Math.floor(hrs / 24)}d ago`
+}
+
+function timeAgoTs(ts: number) {
+  const s = Math.floor((Date.now() - ts) / 1000)
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`
+  return `${Math.floor(s / 86400)}d ago`
+}
+
+function uptimePct(dev: NetDevice) {
+  if (!dev.scansTotal) return 0
+  return Math.round((dev.scansOnline / dev.scansTotal) * 100)
+}
+
+function latencyColor(ms: number | null) {
+  if (ms === null) return '#333'
+  if (ms < 10) return '#4caf88'
+  if (ms < 50) return '#5b8dee'
+  if (ms < 150) return '#e0c060'
+  return '#e07b3a'
+}
+
+function Sparkline({ data }: { data: number[] }) {
+  if (data.length < 2) return null
+  const w = 80; const h = 24
+  const max = Math.max(...data, 1)
+  const pts = data.map((v, i) => {
+    const x = (i / (data.length - 1)) * w
+    const y = h - (v / max) * h
+    return `${x},${y}`
+  }).join(' ')
+  return (
+    <svg width={w} height={h} style={{ display: 'block' }}>
+      <polyline points={pts} fill="none" stroke="#5b8dee" strokeWidth="1.5" opacity="0.7" />
+    </svg>
+  )
 }
 
 export default function NetworkScanner() {
@@ -82,15 +133,21 @@ export default function NetworkScanner() {
   const [tab, setTab] = useState<Tab>('online')
 
   // Probe state
-  const [probing, setProbing] = useState<string | null>(null) // IP being probed
+  const [probing, setProbing] = useState<string | null>(null)
   const [probeResults, setProbeResults] = useState<Record<string, ProbeResult>>({})
   const [deepScanAll, setDeepScanAll] = useState(false)
   const [deepScanProgress, setDeepScanProgress] = useState<{ current: number; total: number; ip: string } | null>(null)
+
+  // Network Monitor state
+  const [netmon, setNetmon] = useState<NetmonSnapshot>({ devices: [], events: [] })
 
   useEffect(() => {
     Promise.all([
       window.ipcRenderer.invoke('load-notes').then(setNotes),
       window.ipcRenderer.invoke('load-history').then(setHistory),
+      window.ipcRenderer.invoke('load-probes').then((p: Record<string, ProbeResult>) => {
+        if (p) setProbeResults(p)
+      }),
       window.ipcRenderer.invoke('scan-network-cached').then((cached: Device[]) => {
         if (cached && cached.length > 0) {
           setDevices(cached)
@@ -98,6 +155,9 @@ export default function NetworkScanner() {
         }
       }),
       window.ipcRenderer.invoke('get-ssid').then(setSsid),
+      window.ipcRenderer.invoke('netmon-get-state').then((s: NetmonSnapshot) => {
+        if (s) setNetmon(s)
+      }),
     ]).then(() => {
       if (devices.length === 0) runScan()
     })
@@ -113,11 +173,25 @@ export default function NetworkScanner() {
     }
     window.ipcRenderer.on('deep-scan-progress', onDeepProgress)
 
+    // Incremental probe results from auto-probe
+    const onProbeResult = (_e: unknown, ip: string, result: ProbeResult) => {
+      setProbeResults(prev => ({ ...prev, [ip]: result }))
+    }
+    window.ipcRenderer.on('probe-result', onProbeResult)
+
+    // Network monitor updates
+    const onNetmonUpdate = (_: unknown, s: NetmonSnapshot) => {
+      setNetmon(s)
+    }
+    window.ipcRenderer.on('netmon-update', onNetmonUpdate)
+
     const tickInterval = setInterval(() => setTick(t => t + 1), 10_000)
 
     return () => {
       window.ipcRenderer.off('scanner-update', onUpdate)
       window.ipcRenderer.off('deep-scan-progress', onDeepProgress)
+      window.ipcRenderer.off('probe-result', onProbeResult)
+      window.ipcRenderer.off('netmon-update', onNetmonUpdate)
       clearInterval(tickInterval)
     }
   }, [])
@@ -141,6 +215,9 @@ export default function NetworkScanner() {
     setHistory(currentHistory)
     setLastScanned(new Date())
     setScanning(false)
+
+    // Auto-probe new devices in background
+    window.ipcRenderer.invoke('auto-probe-new', result.map(d => ({ ip: d.ip, mac: d.mac })))
   }
 
   function selectDevice(mac: string) {
@@ -181,6 +258,18 @@ export default function NetworkScanner() {
     setDeepScanProgress(null)
   }
 
+  async function setWatch(mac: string, watchOnline: boolean, watchOffline: boolean) {
+    await window.ipcRenderer.invoke('netmon-set-watch', mac, watchOnline, watchOffline)
+  }
+
+  async function forgetDevice(mac: string) {
+    await window.ipcRenderer.invoke('netmon-forget', mac)
+    setSelected(null)
+  }
+
+  // Build netmon device lookup
+  const netmonMap = new Map(netmon.devices.map(d => [d.mac, d]))
+
   const sortedDevices = [...devices].sort((a, b) => {
     const aHasLabel = !!(notes[a.mac]?.label)
     const bHasLabel = !!(notes[b.mac]?.label)
@@ -194,13 +283,30 @@ export default function NetworkScanner() {
     .filter(h => !onlineMacs.has(h.mac) && h.ssid === ssid)
     .sort((a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime())
 
+  // Group all history by network SSID
+  const networkMap: Record<string, HistoryEntry[]> = {}
+  for (const h of Object.values(history)) {
+    const net = h.ssid || 'Unknown'
+    if (!networkMap[net]) networkMap[net] = []
+    networkMap[net].push(h)
+  }
+  for (const net of Object.keys(networkMap)) {
+    networkMap[net].sort((a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime())
+  }
+  const networks = Object.entries(networkMap).sort((a, b) => {
+    if (a[0] === ssid) return -1
+    if (b[0] === ssid) return 1
+    return new Date(b[1][0].lastSeen).getTime() - new Date(a[1][0].lastSeen).getTime()
+  })
+
+  const [expandedNet, setExpandedNet] = useState<string | null>(null)
+
   function renderProbeResult(ip: string) {
     const probe = probeResults[ip]
     if (!probe) return null
 
     return (
       <div className="probe-results">
-        {/* Device identity */}
         <div className="probe-section">
           <div className="probe-identity">
             {probe.vendor && <span className="probe-vendor">{probe.vendor}</span>}
@@ -228,7 +334,6 @@ export default function NetworkScanner() {
           )}
         </div>
 
-        {/* Open ports */}
         {probe.ports.length > 0 && (
           <div className="probe-section">
             <div className="probe-section-title">OPEN PORTS ({probe.ports.length})</div>
@@ -248,7 +353,6 @@ export default function NetworkScanner() {
           </div>
         )}
 
-        {/* Web services */}
         {probe.http.length > 0 && (
           <div className="probe-section">
             <div className="probe-section-title">WEB SERVICES</div>
@@ -263,7 +367,6 @@ export default function NetworkScanner() {
           </div>
         )}
 
-        {/* mDNS services */}
         {probe.mdnsServices.length > 0 && (
           <div className="probe-section">
             <div className="probe-section-title">mDNS SERVICES</div>
@@ -275,10 +378,83 @@ export default function NetworkScanner() {
           </div>
         )}
 
-        {/* Nothing found */}
         {probe.ports.length === 0 && (
           <div className="probe-empty">No open ports found — device may have a firewall</div>
         )}
+      </div>
+    )
+  }
+
+  function renderNetmonStats(mac: string) {
+    const nd = netmonMap.get(mac)
+    if (!nd) return null
+    const uptime = uptimePct(nd)
+
+    return (
+      <div className="netmon-inline">
+        {/* Stats row */}
+        <div className="netmon-stat-row">
+          <div className="netmon-stat-cell">
+            <span className="netmon-stat-label">UPTIME</span>
+            <span className="netmon-stat-val" style={{ color: uptime > 80 ? '#4caf88' : uptime > 50 ? '#e0c060' : '#e07b3a' }}>
+              {uptime}%
+            </span>
+            <span className="netmon-stat-sub">{nd.scansOnline}/{nd.scansTotal}</span>
+          </div>
+          <div className="netmon-stat-cell">
+            <span className="netmon-stat-label">LATENCY</span>
+            <span className="netmon-stat-val" style={{ color: latencyColor(nd.latencyMs) }}>
+              {nd.latencyMs !== null ? `${nd.latencyMs.toFixed(0)}ms` : '—'}
+            </span>
+            {nd.latencyHistory.length > 0 && (
+              <span className="netmon-stat-sub">
+                avg {(nd.latencyHistory.reduce((a, b) => a + b, 0) / nd.latencyHistory.length).toFixed(0)}ms
+              </span>
+            )}
+          </div>
+          <div className="netmon-stat-cell">
+            <span className="netmon-stat-label">FIRST SEEN</span>
+            <span className="netmon-stat-val netmon-stat-val--sm">{timeAgoTs(nd.firstSeen)}</span>
+          </div>
+          <div className="netmon-stat-cell">
+            <span className="netmon-stat-label">LAST SEEN</span>
+            <span className="netmon-stat-val netmon-stat-val--sm">{timeAgoTs(nd.lastSeen)}</span>
+          </div>
+        </div>
+
+        {/* Latency sparkline */}
+        {nd.latencyHistory.length >= 2 && (
+          <div className="netmon-sparkline-section">
+            <span className="netmon-stat-label">LATENCY HISTORY</span>
+            <Sparkline data={nd.latencyHistory} />
+          </div>
+        )}
+
+        {/* Uptime bar */}
+        <div className="netmon-uptime-bar-section">
+          <span className="netmon-stat-label">UPTIME</span>
+          <div className="netmon-uptime-bar">
+            <div className="netmon-uptime-fill" style={{ width: `${uptime}%`, background: uptime > 80 ? '#4caf88' : uptime > 50 ? '#e0c060' : '#e07b3a' }} />
+          </div>
+        </div>
+
+        {/* Watch toggles */}
+        <div className="netmon-watch-section">
+          <span className="netmon-stat-label">NOTIFICATIONS</span>
+          <div className="netmon-watch-toggles">
+            <label className="netmon-toggle">
+              <input type="checkbox" checked={nd.watchOnline} onChange={e => setWatch(mac, e.target.checked, nd.watchOffline)} />
+              <span>Online</span>
+            </label>
+            <label className="netmon-toggle">
+              <input type="checkbox" checked={nd.watchOffline} onChange={e => setWatch(mac, nd.watchOnline, e.target.checked)} />
+              <span>Offline</span>
+            </label>
+          </div>
+        </div>
+
+        {/* Forget */}
+        <button className="netmon-forget-btn" onClick={() => forgetDevice(mac)}>FORGET DEVICE</button>
       </div>
     )
   }
@@ -289,12 +465,17 @@ export default function NetworkScanner() {
     const primary = info?.label || null
     const hasProbe = !!probeResults[ip]
     const isProbing = probing === ip
+    const nd = netmonMap.get(mac)
 
     return (
       <div key={mac} className={`device-row${isOpen ? ' device-row--open' : ''}${isOffline ? ' device-row--offline' : ''}`}>
         <div className="device-summary" onClick={() => selectDevice(mac)}>
           <div className="device-left">
-            <div className="device-primary">{primary ?? ip}</div>
+            <div className="device-primary">
+              {nd && <span className={`netmon-dot${nd.online ? ' online' : ''}`} />}
+              {primary ?? ip}
+              {nd && (nd.watchOnline || nd.watchOffline) && <span className="netmon-bell-sm">&#x1f514;</span>}
+            </div>
             <div className="device-secondary">
               {primary && <span className="device-ip-small">{ip}</span>}
               {!primary && hostname && <span className="device-hostname">{hostname}</span>}
@@ -306,6 +487,14 @@ export default function NetworkScanner() {
                   {probeResults[ip].ports.length} ports · {probeResults[ip].osGuess}
                   {probeResults[ip].vendor ? ` · ${probeResults[ip].vendor}` : ''}
                 </span>
+              )}
+              {nd && nd.latencyMs !== null && !isOpen && (
+                <span className="device-latency-badge" style={{ color: latencyColor(nd.latencyMs) }}>
+                  {nd.latencyMs.toFixed(0)}ms
+                </span>
+              )}
+              {nd && !isOpen && (
+                <span className="device-uptime-badge">{uptimePct(nd)}% up</span>
               )}
             </div>
           </div>
@@ -329,6 +518,9 @@ export default function NetworkScanner() {
               {!isOffline && <><span className="meta-key">IF</span><span className="meta-val">{iface}</span></>}
             </div>
 
+            {/* Network Monitor stats */}
+            {renderNetmonStats(mac)}
+
             {/* Probe buttons */}
             {!isOffline && (
               <div className="probe-btn-row">
@@ -349,7 +541,6 @@ export default function NetworkScanner() {
               </div>
             )}
 
-            {/* Probe results */}
             {isProbing && (
               <div className="probe-loading">
                 <span className="scan-pulse">SCANNING PORTS & SERVICES</span>
@@ -387,30 +578,35 @@ export default function NetworkScanner() {
           <button className={`tab-btn${tab === 'history' ? ' tab-btn--active' : ''}`} onClick={() => setTab('history')}>
             HISTORY <span className="tab-count">{offlineHistory.length}</span>
           </button>
+          <button className={`tab-btn${tab === 'networks' ? ' tab-btn--active' : ''}`} onClick={() => setTab('networks')}>
+            NETWORKS <span className="tab-count">{networks.length}</span>
+          </button>
+          <button className={`tab-btn${tab === 'events' ? ' tab-btn--active' : ''}`} onClick={() => setTab('events')}>
+            EVENTS {netmon.events.length > 0 && <span className="tab-count">{netmon.events.length > 99 ? '99+' : netmon.events.length}</span>}
+          </button>
         </div>
 
-        {ssid && <div className="ssid-badge">{ssid}</div>}
-
-        <div className="scanner-actions">
-          {!deepScanAll && devices.length > 0 && (
-            <button className="scan-btn probe-btn" onClick={runDeepScanAll} disabled={deepScanAll}>
-              SCAN ALL
-            </button>
-          )}
-          {deepScanAll && deepScanProgress && (
+        <div className="scanner-right-bar">
+          {ssid && <span className="ssid-badge-sm">{ssid}</span>}
+          <span className="scanner-status-text">
+            {scanning
+              ? <span className="scan-pulse">SCANNING</span>
+              : lastScanned
+                ? <span className="scan-last">updated {timeAgo(lastScanned.toISOString())}</span>
+                : null
+            }
+          </span>
+          {deepScanAll && deepScanProgress ? (
             <span className="scan-pulse deep-scan-status">
               {deepScanProgress.current}/{deepScanProgress.total} — {deepScanProgress.ip}
             </span>
+          ) : (
+            devices.length > 0 && (
+              <button className="scanner-action-btn" onClick={runDeepScanAll} disabled={deepScanAll} title="Deep probe all devices">
+                DEEP SCAN
+              </button>
+            )
           )}
-        </div>
-
-        <div className="scanner-status">
-          {scanning
-            ? <span className="scan-pulse">SCANNING</span>
-            : lastScanned
-              ? <span className="scan-last">updated {timeAgo(lastScanned.toISOString())}</span>
-              : null
-          }
         </div>
       </div>
 
@@ -423,6 +619,72 @@ export default function NetworkScanner() {
         )}
         {tab === 'history' && offlineHistory.length === 0 && (
           <div className="empty-state">No offline devices on {ssid ?? 'this network'} yet.</div>
+        )}
+
+        {tab === 'networks' && networks.map(([netName, netDevices]) => {
+          const isCurrent = netName === ssid
+          const isExpanded = expandedNet === netName
+          const onlineCount = isCurrent ? netDevices.filter(d => onlineMacs.has(d.mac)).length : 0
+
+          return (
+            <div key={netName} className="net-group">
+              <div className="net-header" onClick={() => setExpandedNet(isExpanded ? null : netName)}>
+                <div className="net-header-left">
+                  <span className={`net-name${isCurrent ? ' net-name--current' : ''}`}>{netName}</span>
+                  {isCurrent && <span className="net-current-badge">CONNECTED</span>}
+                </div>
+                <div className="net-header-right">
+                  <span className="net-device-count">{netDevices.length} device{netDevices.length !== 1 ? 's' : ''}</span>
+                  {isCurrent && onlineCount > 0 && <span className="net-online-count">{onlineCount} online</span>}
+                  <span className="net-last-seen">last seen {timeAgo(netDevices[0].lastSeen)}</span>
+                  <span className="device-toggle">{isExpanded ? '▲' : '▼'}</span>
+                </div>
+              </div>
+              {isExpanded && (
+                <div className="net-devices">
+                  {netDevices.map(h => {
+                    const isOnline = onlineMacs.has(h.mac)
+                    const dev = isOnline ? devices.find(d => d.mac === h.mac) : null
+                    return renderDeviceRow(h.mac, dev?.ip ?? h.ip, dev?.hostname ?? h.hostname, dev?.iface ?? '', !isOnline)
+                  })}
+                </div>
+              )}
+            </div>
+          )
+        })}
+        {tab === 'networks' && networks.length === 0 && (
+          <div className="empty-state">No networks seen yet. Scan to discover devices.</div>
+        )}
+
+        {tab === 'events' && (
+          <div className="netmon-events">
+            {netmon.events.length === 0 && (
+              <div className="empty-state">No events yet — events appear as devices join and leave.</div>
+            )}
+            {netmon.events.map(ev => {
+              const isJoin = ev.type === 'joined'
+              const isNew = ev.type === 'new'
+              const nd = netmonMap.get(ev.mac)
+              return (
+                <div key={ev.id} className={`netmon-event netmon-event--${ev.type}`}>
+                  <div className="netmon-event-icon">
+                    {isNew ? '◆' : isJoin ? '●' : '○'}
+                  </div>
+                  <div className="netmon-event-body">
+                    <div className="netmon-event-title">
+                      <span className="netmon-event-type">{isNew ? 'NEW DEVICE' : isJoin ? 'JOINED' : 'LEFT'}</span>
+                      <span className="netmon-event-name">{ev.name}</span>
+                    </div>
+                    <div className="netmon-event-sub">
+                      {ev.ip}
+                      {nd && <span> · {uptimePct(nd)}% uptime</span>}
+                    </div>
+                  </div>
+                  <div className="netmon-event-time">{timeAgoTs(ev.ts)}</div>
+                </div>
+              )
+            })}
+          </div>
         )}
       </div>
     </div>

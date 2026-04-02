@@ -433,6 +433,65 @@ ipcMain.handle('save-history', (_event, history: unknown) => {
   fs.writeFileSync(historyPath(), JSON.stringify(history, null, 2))
 })
 
+// --- Probe persistence ---
+function probesPath() {
+  return path.join(app.getPath('userData'), 'device-probes.json')
+}
+
+let cachedProbes: Record<string, unknown> = {}
+try {
+  const p = probesPath()
+  if (fs.existsSync(p)) cachedProbes = JSON.parse(fs.readFileSync(p, 'utf-8'))
+} catch {}
+
+function saveProbes() {
+  try { fs.writeFileSync(probesPath(), JSON.stringify(cachedProbes, null, 2)) } catch {}
+}
+
+ipcMain.handle('load-probes', () => cachedProbes)
+
+ipcMain.handle('save-probe', (_event, ip: string, result: unknown) => {
+  cachedProbes[ip] = result
+  saveProbes()
+})
+
+// Auto-probe: after a scan, probe any device that hasn't been probed yet (runs in background)
+ipcMain.handle('auto-probe-new', async (_event, devices: { ip: string; mac: string }[]) => {
+  const unprobed = devices.filter(d => !cachedProbes[d.ip])
+  const results: Record<string, unknown> = {}
+  for (const d of unprobed) {
+    try {
+      const ttl = await getTTL(d.ip)
+      const portResults = await Promise.all(
+        PROBE_PORTS.map(async p => {
+          const r = await tcpProbe(d.ip, p.port, 1000)
+          return r.open ? { port: p.port, name: p.name, open: true, banner: r.banner } : null
+        })
+      )
+      const openPorts = portResults.filter(Boolean) as { port: number; name: string; open: boolean; banner: string }[]
+      const httpResults: { port: number; server: string; title: string; redirectUrl: string; secure: boolean }[] = []
+      for (const p of openPorts.filter(p => [80, 443, 8080, 8443, 8000, 5000, 32400].includes(p.port))) {
+        const secure = [443, 8443].includes(p.port)
+        const h = await httpProbe(d.ip, p.port, secure)
+        if (h.server || h.title) httpResults.push({ port: p.port, secure, ...h })
+      }
+      const result = {
+        ip: d.ip, mac: d.mac, vendor: lookupVendor(d.mac),
+        ttl, osGuess: guessOS(ttl), ports: openPorts, http: httpResults,
+        mdnsServices: [], netbiosName: '', ssdpInfo: '', arpType: '', reverseDns: '',
+      }
+      results[d.ip] = result
+      cachedProbes[d.ip] = result
+      // Send incremental update to renderer
+      BrowserWindow.getAllWindows().forEach(w => {
+        try { w.webContents.send('probe-result', d.ip, result) } catch {}
+      })
+    } catch {}
+  }
+  saveProbes()
+  return results
+})
+
 // --- Network Probe / Deep Scan ---
 
 // Common ports to scan, grouped by service type
@@ -673,6 +732,10 @@ ipcMain.handle('probe-device', async (_event, ip: string, mac?: string) => {
     result.mdnsServices = await mdnsProbe(ip)
   }
 
+  // Auto-save probe result to disk
+  cachedProbes[ip] = result
+  saveProbes()
+
   return result
 })
 
@@ -906,6 +969,10 @@ ipcMain.handle('deep-probe-device', async (_event, ip: string, mac?: string) => 
   // mDNS
   result.mdnsServices = await mdnsProbe(ip)
 
+  // Auto-save probe result to disk
+  cachedProbes[ip] = result
+  saveProbes()
+
   return result
 })
 
@@ -950,6 +1017,9 @@ ipcMain.handle('deep-scan-all', async (_event, devices: { ip: string; mac: strin
       }
     } catch {}
   }
+  // Save all probe results to disk
+  Object.assign(cachedProbes, results)
+  saveProbes()
   return results
 })
 

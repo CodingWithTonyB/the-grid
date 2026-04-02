@@ -456,10 +456,18 @@ function App({ onReady }: { onReady?: () => void }) {
       window.ipcRenderer.invoke('load-module-labels').then((saved: any) => { if (saved) setLabels(saved) }),
       window.ipcRenderer.invoke('load-layout').then((saved: GridItem[] | null) => {
         if (saved && Array.isArray(saved)) {
+          const validIds = new Set(modules.map(m => m.id))
+          // Filter out modules/folder children that no longer exist
+          const cleaned = saved
+            .map(item => {
+              if (item.type === 'folder') return { ...item, children: item.children.filter(id => validIds.has(id)) }
+              return item
+            })
+            .filter(item => item.type === 'folder' ? item.children.length > 0 : validIds.has(item.id))
           const allIds = new Set<string>()
-          saved.forEach(item => { allIds.add(item.id); if (item.type === 'folder') item.children.forEach(id => allIds.add(id)) })
+          cleaned.forEach(item => { allIds.add(item.id); if (item.type === 'folder') item.children.forEach(id => allIds.add(id)) })
           const newMods = modules.filter(m => !allIds.has(m.id)).map(m => ({ type: 'module' as const, id: m.id }))
-          setLayout([...saved, ...newMods])
+          setLayout([...cleaned, ...newMods])
         }
       }),
       window.ipcRenderer.invoke('load-archived').then((saved: string[] | null) => { if (saved) setArchived(saved) }),

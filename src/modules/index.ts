@@ -1,8 +1,6 @@
 import { ComponentType } from 'react'
 import NetworkScannerMeta from './NetworkScanner/meta'
 import NetworkScanner from './NetworkScanner'
-import NetworkMonitorMeta from './NetworkMonitor/meta'
-import NetworkMonitor from './NetworkMonitor'
 import FinderMeta from './Finder/meta'
 import Finder from './Finder'
 import CameraViewerMeta from './CameraViewer/meta'
@@ -27,7 +25,6 @@ export interface Module {
 
 const modules: Module[] = [
   { ...NetworkScannerMeta, component: NetworkScanner },
-  { ...NetworkMonitorMeta, component: NetworkMonitor },
   { ...FinderMeta, component: Finder },
   { ...CameraViewerMeta, component: CameraViewer },
   { ...SpeedTestMeta, component: SpeedTest },

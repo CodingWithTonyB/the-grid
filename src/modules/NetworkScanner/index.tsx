@@ -71,7 +71,16 @@ interface NetEvent {
 }
 interface NetmonSnapshot { devices: NetDevice[]; events: NetEvent[] }
 
-type Tab = 'online' | 'history' | 'networks' | 'events'
+// WiFi Recon types
+interface WifiNetwork {
+  ssid: string; bssid: string; rssi: number; channel: number
+  band: number; channelWidth: number; noise: number; ibss: boolean
+  countryCode: string; beaconInterval: number; security: string; securityLevel: number
+  vendor: string; signalQuality: number; bandLabel: string
+}
+
+type Mode = 'network' | 'recon'
+type NetTab = 'devices' | 'networks' | 'events'
 
 function timeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
@@ -130,7 +139,8 @@ export default function NetworkScanner() {
   const [, setTick] = useState(0)
   const [selected, setSelected] = useState<string | null>(null)
   const [draft, setDraft] = useState<DeviceNote>({ label: '', note: '' })
-  const [tab, setTab] = useState<Tab>('online')
+  const [mode, setMode] = useState<Mode>('network')
+  const [netTab, setNetTab] = useState<NetTab>('devices')
 
   // Probe state
   const [probing, setProbing] = useState<string | null>(null)
@@ -140,6 +150,12 @@ export default function NetworkScanner() {
 
   // Network Monitor state
   const [netmon, setNetmon] = useState<NetmonSnapshot>({ devices: [], events: [] })
+
+  // WiFi Recon state
+  const [reconNetworks, setReconNetworks] = useState<WifiNetwork[]>([])
+  const [reconScanning, setReconScanning] = useState(false)
+  const [reconFilter, setReconFilter] = useState<'all' | '2.4' | '5' | '6'>('all')
+  const [reconSort, setReconSort] = useState<'signal' | 'channel' | 'security'>('signal')
 
   useEffect(() => {
     Promise.all([
@@ -265,6 +281,13 @@ export default function NetworkScanner() {
   async function forgetDevice(mac: string) {
     await window.ipcRenderer.invoke('netmon-forget', mac)
     setSelected(null)
+  }
+
+  async function runReconScan() {
+    setReconScanning(true)
+    const results: WifiNetwork[] = await window.ipcRenderer.invoke('wifi-recon-scan')
+    setReconNetworks(results)
+    setReconScanning(false)
   }
 
   // Build netmon device lookup
@@ -568,125 +591,318 @@ export default function NetworkScanner() {
     )
   }
 
+  // Recon analysis helpers
+  const reconFiltered = reconFilter === 'all' ? reconNetworks
+    : reconNetworks.filter(n => n.bandLabel.startsWith(reconFilter))
+  const reconSorted = [...reconFiltered].sort((a, b) => {
+    if (reconSort === 'signal') return b.rssi - a.rssi
+    if (reconSort === 'channel') return a.channel - b.channel
+    return a.securityLevel - b.securityLevel
+  })
+
+  // Detect anomalies for recon
+  const reconAnomalies: { type: string; msg: string; level: 'warn' | 'danger' | 'info' }[] = []
+  {
+    // Open networks
+    const openNets = reconNetworks.filter(n => n.securityLevel === 1)
+    if (openNets.length) reconAnomalies.push({ type: 'open', msg: `${openNets.length} open network${openNets.length > 1 ? 's' : ''} — no encryption`, level: 'danger' })
+    // WEP
+    const wepNets = reconNetworks.filter(n => n.securityLevel === 2)
+    if (wepNets.length) reconAnomalies.push({ type: 'wep', msg: `${wepNets.length} WEP network${wepNets.length > 1 ? 's' : ''} — easily crackable`, level: 'danger' })
+    // Evil twin detection: same SSID, different security levels
+    const ssidSec = new Map<string, Set<number>>()
+    for (const n of reconNetworks) {
+      if (n.ssid === '(hidden)') continue
+      if (!ssidSec.has(n.ssid)) ssidSec.set(n.ssid, new Set())
+      ssidSec.get(n.ssid)!.add(n.securityLevel)
+    }
+    for (const [name, secs] of ssidSec) {
+      if (secs.size > 1) reconAnomalies.push({ type: 'twin', msg: `"${name}" seen with different security levels — possible evil twin`, level: 'warn' })
+    }
+    // Channel congestion
+    const ch24 = reconNetworks.filter(n => n.band === 1)
+    const chCounts: Record<number, number> = {}
+    for (const n of ch24) { chCounts[n.channel] = (chCounts[n.channel] || 0) + 1 }
+    for (const [ch, count] of Object.entries(chCounts)) {
+      if (count >= 6) reconAnomalies.push({ type: 'congestion', msg: `Channel ${ch} (2.4 GHz) very congested — ${count} networks`, level: 'info' })
+    }
+    // Hidden networks
+    const hiddenCount = reconNetworks.filter(n => n.ssid === '(hidden)').length
+    if (hiddenCount) reconAnomalies.push({ type: 'hidden', msg: `${hiddenCount} hidden network${hiddenCount > 1 ? 's' : ''} detected`, level: 'info' })
+  }
+
   return (
     <div className="scanner">
-      <div className="scanner-toolbar">
-        <div className="scanner-tabs">
-          <button className={`tab-btn${tab === 'online' ? ' tab-btn--active' : ''}`} onClick={() => setTab('online')}>
-            ONLINE <span className="tab-count">{devices.length}</span>
-          </button>
-          <button className={`tab-btn${tab === 'history' ? ' tab-btn--active' : ''}`} onClick={() => setTab('history')}>
-            HISTORY <span className="tab-count">{offlineHistory.length}</span>
-          </button>
-          <button className={`tab-btn${tab === 'networks' ? ' tab-btn--active' : ''}`} onClick={() => setTab('networks')}>
-            NETWORKS <span className="tab-count">{networks.length}</span>
-          </button>
-          <button className={`tab-btn${tab === 'events' ? ' tab-btn--active' : ''}`} onClick={() => setTab('events')}>
-            EVENTS {netmon.events.length > 0 && <span className="tab-count">{netmon.events.length > 99 ? '99+' : netmon.events.length}</span>}
-          </button>
-        </div>
-
-        <div className="scanner-right-bar">
-          {ssid && <span className="ssid-badge-sm">{ssid}</span>}
-          <span className="scanner-status-text">
-            {scanning
-              ? <span className="scan-pulse">SCANNING</span>
-              : lastScanned
-                ? <span className="scan-last">updated {timeAgo(lastScanned.toISOString())}</span>
-                : null
-            }
-          </span>
-          {deepScanAll && deepScanProgress ? (
-            <span className="scan-pulse deep-scan-status">
-              {deepScanProgress.current}/{deepScanProgress.total} — {deepScanProgress.ip}
-            </span>
-          ) : (
-            devices.length > 0 && (
-              <button className="scanner-action-btn" onClick={runDeepScanAll} disabled={deepScanAll} title="Deep probe all devices">
-                DEEP SCAN
-              </button>
-            )
-          )}
-        </div>
+      {/* Top-level mode switcher */}
+      <div className="scanner-mode-bar">
+        <button className={`scanner-mode-btn${mode === 'network' ? ' active' : ''}`} onClick={() => setMode('network')}>
+          NETWORK
+        </button>
+        <button className={`scanner-mode-btn${mode === 'recon' ? ' active' : ''}`} onClick={() => { setMode('recon'); if (reconNetworks.length === 0 && !reconScanning) runReconScan() }}>
+          RECON
+        </button>
       </div>
 
-      <div className="device-list">
-        {tab === 'online' && sortedDevices.map(d =>
-          renderDeviceRow(d.mac, d.ip, d.hostname, d.iface)
-        )}
-        {tab === 'history' && offlineHistory.map(h =>
-          renderDeviceRow(h.mac, h.ip, h.hostname, '', true)
-        )}
-        {tab === 'history' && offlineHistory.length === 0 && (
-          <div className="empty-state">No offline devices on {ssid ?? 'this network'} yet.</div>
-        )}
+      {mode === 'network' && (
+        <>
+          <div className="scanner-toolbar">
+            <div className="scanner-tabs">
+              <button className={`tab-btn${netTab === 'devices' ? ' tab-btn--active' : ''}`} onClick={() => setNetTab('devices')}>
+                DEVICES <span className="tab-count">{devices.length}</span>
+              </button>
+              <button className={`tab-btn${netTab === 'networks' ? ' tab-btn--active' : ''}`} onClick={() => setNetTab('networks')}>
+                NETWORKS <span className="tab-count">{networks.length}</span>
+              </button>
+              <button className={`tab-btn${netTab === 'events' ? ' tab-btn--active' : ''}`} onClick={() => setNetTab('events')}>
+                EVENTS {netmon.events.length > 0 && <span className="tab-count">{netmon.events.length > 99 ? '99+' : netmon.events.length}</span>}
+              </button>
+            </div>
 
-        {tab === 'networks' && networks.map(([netName, netDevices]) => {
-          const isCurrent = netName === ssid
-          const isExpanded = expandedNet === netName
-          const onlineCount = isCurrent ? netDevices.filter(d => onlineMacs.has(d.mac)).length : 0
-
-          return (
-            <div key={netName} className="net-group">
-              <div className="net-header" onClick={() => setExpandedNet(isExpanded ? null : netName)}>
-                <div className="net-header-left">
-                  <span className={`net-name${isCurrent ? ' net-name--current' : ''}`}>{netName}</span>
-                  {isCurrent && <span className="net-current-badge">CONNECTED</span>}
-                </div>
-                <div className="net-header-right">
-                  <span className="net-device-count">{netDevices.length} device{netDevices.length !== 1 ? 's' : ''}</span>
-                  {isCurrent && onlineCount > 0 && <span className="net-online-count">{onlineCount} online</span>}
-                  <span className="net-last-seen">last seen {timeAgo(netDevices[0].lastSeen)}</span>
-                  <span className="device-toggle">{isExpanded ? '▲' : '▼'}</span>
-                </div>
-              </div>
-              {isExpanded && (
-                <div className="net-devices">
-                  {netDevices.map(h => {
-                    const isOnline = onlineMacs.has(h.mac)
-                    const dev = isOnline ? devices.find(d => d.mac === h.mac) : null
-                    return renderDeviceRow(h.mac, dev?.ip ?? h.ip, dev?.hostname ?? h.hostname, dev?.iface ?? '', !isOnline)
-                  })}
-                </div>
+            <div className="scanner-right-bar">
+              {ssid && <span className="ssid-badge-sm">{ssid}</span>}
+              <span className="scanner-status-text">
+                {scanning
+                  ? <span className="scan-pulse">SCANNING</span>
+                  : lastScanned
+                    ? <span className="scan-last">updated {timeAgo(lastScanned.toISOString())}</span>
+                    : null
+                }
+              </span>
+              {deepScanAll && deepScanProgress ? (
+                <span className="scan-pulse deep-scan-status">
+                  {deepScanProgress.current}/{deepScanProgress.total} — {deepScanProgress.ip}
+                </span>
+              ) : (
+                devices.length > 0 && (
+                  <button className="scanner-action-btn" onClick={runDeepScanAll} disabled={deepScanAll}>
+                    DEEP SCAN
+                  </button>
+                )
               )}
             </div>
-          )
-        })}
-        {tab === 'networks' && networks.length === 0 && (
-          <div className="empty-state">No networks seen yet. Scan to discover devices.</div>
-        )}
+          </div>
 
-        {tab === 'events' && (
-          <div className="netmon-events">
-            {netmon.events.length === 0 && (
-              <div className="empty-state">No events yet — events appear as devices join and leave.</div>
+          <div className="device-list">
+            {netTab === 'devices' && (
+              <>
+                {sortedDevices.map(d => renderDeviceRow(d.mac, d.ip, d.hostname, d.iface))}
+                {offlineHistory.length > 0 && (
+                  <>
+                    <div className="device-list-divider">OFFLINE</div>
+                    {offlineHistory.map(h => renderDeviceRow(h.mac, h.ip, h.hostname, '', true))}
+                  </>
+                )}
+                {devices.length === 0 && offlineHistory.length === 0 && (
+                  <div className="empty-state">No devices found yet.</div>
+                )}
+              </>
             )}
-            {netmon.events.map(ev => {
-              const isJoin = ev.type === 'joined'
-              const isNew = ev.type === 'new'
-              const nd = netmonMap.get(ev.mac)
+
+            {netTab === 'networks' && networks.map(([netName, netDevices]) => {
+              const isCurrent = netName === ssid
+              const isExpanded = expandedNet === netName
+              const onlineCount = isCurrent ? netDevices.filter(d => onlineMacs.has(d.mac)).length : 0
+
               return (
-                <div key={ev.id} className={`netmon-event netmon-event--${ev.type}`}>
-                  <div className="netmon-event-icon">
-                    {isNew ? '◆' : isJoin ? '●' : '○'}
-                  </div>
-                  <div className="netmon-event-body">
-                    <div className="netmon-event-title">
-                      <span className="netmon-event-type">{isNew ? 'NEW DEVICE' : isJoin ? 'JOINED' : 'LEFT'}</span>
-                      <span className="netmon-event-name">{ev.name}</span>
+                <div key={netName} className="net-group">
+                  <div className="net-header" onClick={() => setExpandedNet(isExpanded ? null : netName)}>
+                    <div className="net-header-left">
+                      <span className={`net-name${isCurrent ? ' net-name--current' : ''}`}>{netName}</span>
+                      {isCurrent && <span className="net-current-badge">CONNECTED</span>}
                     </div>
-                    <div className="netmon-event-sub">
-                      {ev.ip}
-                      {nd && <span> · {uptimePct(nd)}% uptime</span>}
+                    <div className="net-header-right">
+                      <span className="net-device-count">{netDevices.length} device{netDevices.length !== 1 ? 's' : ''}</span>
+                      {isCurrent && onlineCount > 0 && <span className="net-online-count">{onlineCount} online</span>}
+                      <span className="net-last-seen">last seen {timeAgo(netDevices[0].lastSeen)}</span>
+                      <span className="device-toggle">{isExpanded ? '▲' : '▼'}</span>
                     </div>
                   </div>
-                  <div className="netmon-event-time">{timeAgoTs(ev.ts)}</div>
+                  {isExpanded && (
+                    <div className="net-devices">
+                      {netDevices.map(h => {
+                        const isOnline = onlineMacs.has(h.mac)
+                        const dev = isOnline ? devices.find(d => d.mac === h.mac) : null
+                        return renderDeviceRow(h.mac, dev?.ip ?? h.ip, dev?.hostname ?? h.hostname, dev?.iface ?? '', !isOnline)
+                      })}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            {netTab === 'networks' && networks.length === 0 && (
+              <div className="empty-state">No networks seen yet. Scan to discover devices.</div>
+            )}
+
+            {netTab === 'events' && (
+              <div className="netmon-events">
+                {netmon.events.length === 0 && (
+                  <div className="empty-state">No events yet — events appear as devices join and leave.</div>
+                )}
+                {netmon.events.map(ev => {
+                  const isJoin = ev.type === 'joined'
+                  const isNew = ev.type === 'new'
+                  const nd = netmonMap.get(ev.mac)
+                  return (
+                    <div key={ev.id} className={`netmon-event netmon-event--${ev.type}`}>
+                      <div className="netmon-event-icon">
+                        {isNew ? '◆' : isJoin ? '●' : '○'}
+                      </div>
+                      <div className="netmon-event-body">
+                        <div className="netmon-event-title">
+                          <span className="netmon-event-type">{isNew ? 'NEW DEVICE' : isJoin ? 'JOINED' : 'LEFT'}</span>
+                          <span className="netmon-event-name">{ev.name}</span>
+                        </div>
+                        <div className="netmon-event-sub">
+                          {ev.ip}
+                          {nd && <span> · {uptimePct(nd)}% uptime</span>}
+                        </div>
+                      </div>
+                      <div className="netmon-event-time">{timeAgoTs(ev.ts)}</div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {mode === 'recon' && (
+        <div className="recon-view">
+          {/* Recon toolbar */}
+          <div className="recon-toolbar">
+            <div className="recon-filters">
+              {(['all', '2.4', '5', '6'] as const).map(f => (
+                <button key={f} className={`recon-filter-btn${reconFilter === f ? ' active' : ''}`}
+                  onClick={() => setReconFilter(f)}>
+                  {f === 'all' ? 'ALL' : `${f} GHz`}
+                </button>
+              ))}
+            </div>
+            <div className="recon-sorts">
+              {(['signal', 'channel', 'security'] as const).map(s => (
+                <button key={s} className={`recon-filter-btn${reconSort === s ? ' active' : ''}`}
+                  onClick={() => setReconSort(s)}>
+                  {s.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            <span className="recon-count">{reconFiltered.length} network{reconFiltered.length !== 1 ? 's' : ''}</span>
+            <button className="scanner-action-btn" onClick={runReconScan} disabled={reconScanning}>
+              {reconScanning ? 'SCANNING...' : 'RESCAN'}
+            </button>
+          </div>
+
+          {reconScanning && reconNetworks.length === 0 && (
+            <div className="empty-state"><span className="scan-pulse">SCANNING NEARBY NETWORKS</span></div>
+          )}
+
+          {/* Anomaly alerts */}
+          {reconAnomalies.length > 0 && (
+            <div className="recon-alerts">
+              {reconAnomalies.map((a, i) => (
+                <div key={i} className={`recon-alert recon-alert--${a.level}`}>
+                  <span className="recon-alert-icon">{a.level === 'danger' ? '⚠' : a.level === 'warn' ? '⚡' : 'ℹ'}</span>
+                  <span>{a.msg}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Security summary badges */}
+          {reconNetworks.length > 0 && (
+            <div className="recon-security-summary">
+              {(() => {
+                const open = reconNetworks.filter(n => n.securityLevel === 1).length
+                const wep = reconNetworks.filter(n => n.securityLevel === 2).length
+                const wpa = reconNetworks.filter(n => n.securityLevel === 3).length
+                const wpa2 = reconNetworks.filter(n => n.securityLevel === 4).length
+                const wpa3 = reconNetworks.filter(n => n.securityLevel >= 5).length
+                return (
+                  <>
+                    {open > 0 && <span className="recon-sec-badge recon-sec--open">{open} OPEN</span>}
+                    {wep > 0 && <span className="recon-sec-badge recon-sec--wep">{wep} WEP</span>}
+                    {wpa > 0 && <span className="recon-sec-badge recon-sec--wpa">{wpa} WPA</span>}
+                    {wpa2 > 0 && <span className="recon-sec-badge recon-sec--wpa2">{wpa2} WPA2</span>}
+                    {wpa3 > 0 && <span className="recon-sec-badge recon-sec--wpa3">{wpa3} WPA3</span>}
+                  </>
+                )
+              })()}
+            </div>
+          )}
+
+          {/* Channel map */}
+          {reconNetworks.length > 0 && (
+            <div className="recon-channel-map">
+              <div className="recon-section-title">CHANNEL MAP</div>
+              <div className="recon-channels">
+                {(() => {
+                  const channelCounts: Record<string, { count: number; strongest: number }> = {}
+                  for (const n of reconFiltered) {
+                    const key = `${n.channel} ${n.bandLabel}`
+                    if (!channelCounts[key]) channelCounts[key] = { count: 0, strongest: -100 }
+                    channelCounts[key].count++
+                    if (n.rssi > channelCounts[key].strongest) channelCounts[key].strongest = n.rssi
+                  }
+                  return Object.entries(channelCounts)
+                    .sort((a, b) => parseInt(a[0]) - parseInt(b[0]))
+                    .map(([key, val]) => {
+                      const congestion = val.count >= 5 ? 'high' : val.count >= 3 ? 'med' : 'low'
+                      return (
+                        <div key={key} className={`recon-ch recon-ch--${congestion}`}>
+                          <div className="recon-ch-num">CH {key.split(' ')[0]}</div>
+                          <div className="recon-ch-bar-wrap">
+                            <div className="recon-ch-bar" style={{ height: `${Math.min(100, val.count * 20)}%` }} />
+                          </div>
+                          <div className="recon-ch-count">{val.count}</div>
+                        </div>
+                      )
+                    })
+                })()}
+              </div>
+            </div>
+          )}
+
+          {/* Network list */}
+          <div className="device-list">
+            {reconSorted.map((net, i) => {
+              const signalBars = net.signalQuality >= 75 ? 4 : net.signalQuality >= 50 ? 3 : net.signalQuality >= 25 ? 2 : 1
+              const isVulnerable = net.securityLevel <= 2
+              const isYours = net.ssid === ssid
+
+              return (
+                <div key={`${net.ssid}-${net.channel}-${i}`}
+                  className={`recon-row${isVulnerable ? ' recon-row--vuln' : ''}${isYours ? ' recon-row--yours' : ''}`}>
+                  <div className="recon-signal">
+                    <div className="recon-bars">
+                      {[1, 2, 3, 4].map(b => (
+                        <div key={b} className={`recon-bar${b <= signalBars ? ' active' : ''}`} />
+                      ))}
+                    </div>
+                    <span className="recon-rssi">{net.rssi}</span>
+                  </div>
+                  <div className="recon-info">
+                    <div className="recon-ssid">
+                      {net.ssid === '(hidden)' ? <em className="recon-hidden">(hidden)</em> : net.ssid}
+                      {isYours && <span className="recon-yours-badge">YOU</span>}
+                    </div>
+                    <div className="recon-meta">
+                      <span className="recon-band-tag">{net.bandLabel}</span>
+                      <span className="recon-ch-tag">CH {net.channel}</span>
+                      {net.vendor && <span className="recon-vendor">{net.vendor}</span>}
+                      {net.bssid && <span className="recon-bssid">{net.bssid}</span>}
+                    </div>
+                  </div>
+                  <div className={`recon-security-tag recon-sec-lvl--${net.securityLevel <= 1 ? 'open' : net.securityLevel === 2 ? 'wep' : net.securityLevel <= 4 ? 'wpa' : 'wpa3'}`}>
+                    {net.security}
+                    {isVulnerable && <span className="recon-vuln-icon"> ⚠</span>}
+                  </div>
                 </div>
               )
             })}
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   )
 }

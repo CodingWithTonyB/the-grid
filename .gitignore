@@ -42,3 +42,8 @@ netmon-state.json
 clock-ip.json
 grid-layout.json
 module-labels.json
+archived-modules.json
+device-probes.json
+
+# Compiled binaries
+scripts/wifi-scan

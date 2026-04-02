@@ -2606,6 +2606,280 @@ body {
 .netmon-event-sub  { font-size: 10px; color: #777; margin-top: 2px; }
 .netmon-event-time { font-size: 10px; color: #666; flex-shrink: 0; padding-top: 2px; }
 
+/* ── Scanner mode bar ───────────────────────────────────────────────────── */
+.scanner-mode-bar {
+  display: flex;
+  gap: 0;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid #1a1a1a;
+  flex-shrink: 0;
+}
+.scanner-mode-btn {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #555;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  padding: 0.6rem 1.5rem;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.scanner-mode-btn:hover { color: #999; }
+.scanner-mode-btn.active { color: #e0e0e0; border-bottom-color: #0cf; }
+
+.device-list-divider {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: #444;
+  padding: 0.75rem 0.5rem 0.4rem;
+  border-top: 1px solid #151515;
+  margin-top: 0.25rem;
+}
+
+.recon-view {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1;
+  overflow: hidden;
+}
+.recon-view > .device-list {
+  flex: 1;
+  overflow-y: auto;
+}
+.recon-count {
+  font-size: 10px;
+  color: #666;
+  letter-spacing: 1px;
+  margin-left: auto;
+}
+
+/* Recon alerts */
+.recon-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.recon-alert {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 10px;
+  padding: 0.4rem 0.6rem;
+  border-left: 2px solid;
+}
+.recon-alert--danger { color: #e05555; border-color: #e05555; background: #e0555508; }
+.recon-alert--warn   { color: #e0c060; border-color: #e0c060; background: #e0c06008; }
+.recon-alert--info   { color: #5b8dee; border-color: #5b8dee; background: #5b8dee08; }
+.recon-alert-icon { flex-shrink: 0; }
+
+/* ── WiFi Recon ─────────────────────────────────────────────────────────── */
+.recon-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.recon-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #111;
+}
+.recon-filters, .recon-sorts {
+  display: flex;
+  gap: 2px;
+}
+.recon-filter-btn {
+  background: transparent;
+  border: 1px solid #1a1a1a;
+  color: #666;
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.recon-filter-btn:hover { color: #999; border-color: #333; }
+.recon-filter-btn.active { color: #0cf; border-color: #0cf44; background: #0cf08; }
+.recon-sorts { margin-left: auto; }
+
+/* Channel map */
+.recon-channel-map {
+  padding: 0.5rem 0;
+}
+.recon-section-title {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #555;
+  margin-bottom: 6px;
+}
+.recon-channels {
+  display: flex;
+  gap: 3px;
+  align-items: flex-end;
+  height: 50px;
+}
+.recon-ch {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 28px;
+}
+.recon-ch-num { font-size: 8px; color: #555; letter-spacing: 0.5px; }
+.recon-ch-bar-wrap {
+  width: 16px;
+  height: 30px;
+  background: #0a0a0a;
+  border: 1px solid #151515;
+  display: flex;
+  align-items: flex-end;
+  overflow: hidden;
+}
+.recon-ch-bar {
+  width: 100%;
+  background: #333;
+  transition: height 0.3s;
+}
+.recon-ch--low .recon-ch-bar { background: #4caf88; }
+.recon-ch--med .recon-ch-bar { background: #e0c060; }
+.recon-ch--high .recon-ch-bar { background: #e07b3a; }
+.recon-ch-count { font-size: 9px; color: #777; }
+
+/* Security summary badges */
+.recon-security-summary {
+  display: flex;
+  gap: 6px;
+  padding: 0.25rem 0;
+}
+.recon-sec-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 2px 8px;
+  border: 1px solid;
+}
+.recon-sec--open { color: #e05555; border-color: #e0555544; }
+.recon-sec--wep  { color: #e07b3a; border-color: #e07b3a44; }
+.recon-sec--wpa  { color: #e0c060; border-color: #e0c06044; }
+.recon-sec--wpa2 { color: #5b8dee; border-color: #5b8dee44; }
+.recon-sec--wpa3 { color: #4caf88; border-color: #4caf8844; }
+
+/* Network rows */
+.recon-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.5rem;
+  border-bottom: 1px solid #0d0d0d;
+  transition: background 0.1s;
+}
+.recon-row:hover { background: #0f0f0f; }
+.recon-row--vuln { border-left: 2px solid #e05555; padding-left: calc(0.5rem - 2px); }
+.recon-row--yours { background: #0cf06; }
+
+/* Signal bars */
+.recon-signal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 36px;
+  flex-shrink: 0;
+}
+.recon-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+}
+.recon-bar {
+  width: 4px;
+  background: #222;
+  border-radius: 1px;
+}
+.recon-bar:nth-child(1) { height: 4px; }
+.recon-bar:nth-child(2) { height: 8px; }
+.recon-bar:nth-child(3) { height: 12px; }
+.recon-bar:nth-child(4) { height: 16px; }
+.recon-bar.active { background: #4caf88; }
+.recon-rssi { font-size: 9px; color: #555; }
+
+/* Info column */
+.recon-info { flex: 1; min-width: 0; }
+.recon-ssid {
+  font-size: 12px;
+  font-weight: 600;
+  color: #ccc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.recon-hidden { color: #555; font-weight: 400; }
+.recon-yours-badge {
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #0cf;
+  border: 1px solid #0cf44;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+.recon-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+.recon-band-tag {
+  font-size: 9px;
+  font-weight: 600;
+  color: #777;
+  padding: 1px 4px;
+  border: 1px solid #1a1a1a;
+}
+.recon-ch-tag {
+  font-size: 9px;
+  color: #666;
+}
+.recon-vendor {
+  font-size: 9px;
+  color: #555;
+}
+.recon-bssid {
+  font-size: 9px;
+  color: #444;
+  font-family: monospace;
+}
+
+/* Security tag */
+.recon-security-tag {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border: 1px solid #1a1a1a;
+  text-align: center;
+  min-width: 55px;
+}
+.recon-sec-lvl--open { color: #e05555; border-color: #e0555544; }
+.recon-sec-lvl--wep  { color: #e07b3a; border-color: #e07b3a44; }
+.recon-sec-lvl--wpa  { color: #e0c060; border-color: #e0c06044; }
+.recon-sec-lvl--wpa3 { color: #4caf88; border-color: #4caf8844; }
+.recon-vuln-icon { color: #e05555; }
+
 /* ── Claude AI floating button ───────────────────────────────────────────── */
 .ai-fab-btn {
   position: absolute;

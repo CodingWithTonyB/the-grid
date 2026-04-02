@@ -433,6 +433,40 @@ ipcMain.handle('save-history', (_event, history: unknown) => {
   fs.writeFileSync(historyPath(), JSON.stringify(history, null, 2))
 })
 
+// --- WiFi Recon scan ---
+const wifiScanBinary = path.join(process.env.APP_ROOT!, 'scripts', 'wifi-scan')
+
+interface WifiNetwork {
+  ssid: string; bssid: string; rssi: number; channel: number
+  band: number; channelWidth: number; noise: number; ibss: boolean
+  countryCode: string; beaconInterval: number; security: string; securityLevel: number
+}
+
+ipcMain.handle('wifi-recon-scan', async () => {
+  try {
+    const { stdout } = await execAsync(`"${wifiScanBinary}"`, { timeout: 20000 })
+    const networks: WifiNetwork[] = JSON.parse(stdout.trim())
+    // Deduplicate by SSID+channel (same AP on same channel), keep strongest signal
+    const deduped = new Map<string, WifiNetwork>()
+    for (const net of networks) {
+      const key = `${net.ssid || '(hidden)'}-${net.channel}-${net.band}`
+      const existing = deduped.get(key)
+      if (!existing || net.rssi > existing.rssi) deduped.set(key, net)
+    }
+    // Look up vendor from BSSID MAC prefix
+    const result = [...deduped.values()].map(net => ({
+      ...net,
+      ssid: net.ssid || '(hidden)',
+      vendor: net.bssid ? lookupVendor(net.bssid) : '',
+      signalQuality: Math.min(100, Math.max(0, 2 * (net.rssi + 100))), // Convert RSSI to 0-100%
+      bandLabel: net.band === 1 ? '2.4 GHz' : net.band === 2 ? '5 GHz' : net.band === 3 ? '6 GHz' : '?',
+    }))
+    return result.sort((a, b) => b.rssi - a.rssi)
+  } catch {
+    return []
+  }
+})
+
 // --- Probe persistence ---
 function probesPath() {
   return path.join(app.getPath('userData'), 'device-probes.json')
